@@ -1,0 +1,10 @@
+build/
+*.beam
+*.ez
+erl_crash.dump
+.hex_api_key
+/tmp/
+*.sqlite
+*.db
+bench/results/*.json
+reference/

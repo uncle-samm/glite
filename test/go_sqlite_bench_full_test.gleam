@@ -1,6 +1,8 @@
 /// Full go-sqlite-bench comparison (1M rows)
 /// Run with: gleam test -- --module go_sqlite_bench_full_test
 
+import bench_baseline
+import gleam/dict
 import gleam/int
 import gleam/io
 import gleam/list
@@ -17,7 +19,9 @@ pub fn simple_1m_raw_test() {
   let n = 1_000_000
   io.println("")
   io.println("=== Simple Test 1M RAW (execute_many) ===")
-  io.println("Pragmas: journal_mode=DELETE, synchronous=FULL (same as go-sqlite-bench)")
+  io.println(
+    "Pragmas: journal_mode=DELETE, synchronous=FULL (same as go-sqlite-bench)",
+  )
 
   let cfg =
     config.memory()
@@ -59,10 +63,17 @@ pub fn simple_1m_raw_test() {
   let _ = connection.close(db)
 
   io.println(
-    "INSERT " <> int.to_string(n) <> ": " <> int.to_string(insert_ms) <> " ms",
+    "INSERT "
+    <> int.to_string(n)
+    <> ": "
+    <> int.to_string(insert_ms)
+    <> " ms",
   )
   io.println(
-    "QUERY  " <> int.to_string(row_count) <> ": " <> int.to_string(query_ms)
+    "QUERY  "
+    <> int.to_string(row_count)
+    <> ": "
+    <> int.to_string(query_ms)
     <> " ms",
   )
   io.println("")
@@ -73,29 +84,48 @@ pub fn simple_1m_raw_test() {
   io.println("  mattn:   insert 1531ms, query 1018ms")
   io.println("  modernc: insert 5288ms, query 760ms")
   io.println(
-    "  glite:   insert " <> int.to_string(insert_ms) <> "ms,  query " <> int.to_string(
-      query_ms,
-    )
+    "  glite:   insert "
+    <> int.to_string(insert_ms)
+    <> "ms,  query "
+    <> int.to_string(query_ms)
     <> "ms",
   )
-  io.println("")
+
+  // Save and compare against previous baseline
+  let results =
+    dict.new()
+    |> dict.insert("1m_insert", insert_ms)
+    |> dict.insert("1m_query", query_ms)
+
+  bench_baseline.compare_and_save("bench/results/full_1m_baseline.terms", results)
 }
 
 pub fn many_test_all_sizes_test() {
   io.println("")
   io.println("=== Many Test (1000 queries) ===")
-  run_many(10)
-  run_many(100)
-  run_many(1000)
+  let n10 = run_many(10)
+  let n100 = run_many(100)
+  let n1000 = run_many(1000)
   io.println("")
   io.println("Go-sqlite-bench comparison (1000 queries):")
   io.println("  N=10:   sqinn 40ms, craw 13ms, bvinc 15ms, mattn 30ms")
   io.println("  N=100:  sqinn 58ms, craw 59ms, bvinc 66ms, mattn 111ms")
   io.println("  N=1000: sqinn 339ms, craw 499ms, bvinc 532ms, mattn 1000ms")
-  io.println("")
+
+  // Save and compare against previous baseline
+  let results =
+    dict.new()
+    |> dict.insert("many_n10", n10)
+    |> dict.insert("many_n100", n100)
+    |> dict.insert("many_n1000", n1000)
+
+  bench_baseline.compare_and_save(
+    "bench/results/full_many_baseline.terms",
+    results,
+  )
 }
 
-fn run_many(n_rows: Int) -> Nil {
+fn run_many(n_rows: Int) -> Int {
   let n_queries = 1000
 
   let cfg =
@@ -132,6 +162,7 @@ fn run_many(n_rows: Int) -> Nil {
   io.println(
     "  N=" <> int.to_string(n_rows) <> ": " <> int.to_string(ms) <> " ms",
   )
+  ms
 }
 
 fn build_params(

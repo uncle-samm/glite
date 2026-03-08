@@ -3,6 +3,8 @@
 ///
 /// Run with: gleam test -- --module go_sqlite_bench_test
 
+import bench_baseline
+import gleam/dict
 import gleam/int
 import gleam/io
 import gleam/list
@@ -66,20 +68,35 @@ pub fn simple_test_100k_test() {
   glite.disconnect(conn)
 
   io.println(
-    "INSERT " <> int.to_string(n) <> " rows: " <> int.to_string(insert_ms)
+    "INSERT "
+    <> int.to_string(n)
+    <> " rows: "
+    <> int.to_string(insert_ms)
     <> " ms (actor API)",
   )
   io.println(
-    "QUERY  " <> int.to_string(row_count) <> " rows: " <> int.to_string(
-      query_ms,
-    )
+    "QUERY  "
+    <> int.to_string(row_count)
+    <> " rows: "
+    <> int.to_string(query_ms)
     <> " ms (actor API)",
   )
   io.println(
-    "Insert IPS: " <> int.to_string(n * 1000 / { insert_ms + 1 })
+    "Insert IPS: "
+    <> int.to_string(n * 1000 / { insert_ms + 1 })
     <> " rows/sec",
   )
-  io.println("")
+
+  // Save and compare against previous baseline
+  let results =
+    dict.new()
+    |> dict.insert("100k_actor_insert", insert_ms)
+    |> dict.insert("100k_actor_query", query_ms)
+
+  bench_baseline.compare_and_save(
+    "bench/results/100k_actor_baseline.terms",
+    results,
+  )
 }
 
 // =============================================================================
@@ -136,20 +153,35 @@ pub fn simple_test_100k_raw_test() {
   let _ = connection.close(db)
 
   io.println(
-    "INSERT " <> int.to_string(n) <> " rows: " <> int.to_string(insert_ms)
+    "INSERT "
+    <> int.to_string(n)
+    <> " rows: "
+    <> int.to_string(insert_ms)
     <> " ms (raw FFI)",
   )
   io.println(
-    "QUERY  " <> int.to_string(row_count) <> " rows: " <> int.to_string(
-      query_ms,
-    )
+    "QUERY  "
+    <> int.to_string(row_count)
+    <> " rows: "
+    <> int.to_string(query_ms)
     <> " ms (raw FFI)",
   )
   io.println(
-    "Insert IPS: " <> int.to_string(n * 1000 / { insert_ms + 1 })
+    "Insert IPS: "
+    <> int.to_string(n * 1000 / { insert_ms + 1 })
     <> " rows/sec",
   )
-  io.println("")
+
+  // Save and compare against previous baseline
+  let results =
+    dict.new()
+    |> dict.insert("100k_raw_insert", insert_ms)
+    |> dict.insert("100k_raw_query", query_ms)
+
+  bench_baseline.compare_and_save(
+    "bench/results/100k_raw_baseline.terms",
+    results,
+  )
 }
 
 // =============================================================================
@@ -162,9 +194,10 @@ pub fn many_test_1000_rows_test() {
   let n_queries = 1000
   io.println("")
   io.println(
-    "=== Many Test (rows=" <> int.to_string(n_rows) <> ", queries=" <> int.to_string(
-      n_queries,
-    )
+    "=== Many Test (rows="
+    <> int.to_string(n_rows)
+    <> ", queries="
+    <> int.to_string(n_queries)
     <> ") ===",
   )
 
@@ -202,13 +235,24 @@ pub fn many_test_1000_rows_test() {
   let _ = connection.close(db)
 
   io.println(
-    "QUERY " <> int.to_string(n_rows) <> " rows x " <> int.to_string(
-      n_queries,
-    )
-    <> " times: " <> int.to_string(query_ms)
+    "QUERY "
+    <> int.to_string(n_rows)
+    <> " rows x "
+    <> int.to_string(n_queries)
+    <> " times: "
+    <> int.to_string(query_ms)
     <> " ms (raw FFI)",
   )
-  io.println("")
+
+  // Save and compare against previous baseline
+  let results =
+    dict.new()
+    |> dict.insert("many_1000x1000", query_ms)
+
+  bench_baseline.compare_and_save(
+    "bench/results/many_1000x1000_baseline.terms",
+    results,
+  )
 }
 
 // =============================================================================

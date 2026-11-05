@@ -1,4 +1,4 @@
-//// The statement shapes Modorra's store uses for grants, projects and the
+//// The statement shapes a real app's store uses for grants, projects and the
 //// push queue, checked end to end.
 
 import gleam/option.{Some}
@@ -41,9 +41,9 @@ fn store() -> glite.Connection {
   let assert Ok(Nil) = glite.exec_script(conn, schema)
   let assert Ok(1) =
     glite.exec(conn, "INSERT INTO projects VALUES (?, ?, ?, ?)", [
-      glite.text("modorra"),
-      glite.text("/var/lib/modorra/git/modorra.git"),
-      glite.text("github:uncle-samm/modorra"),
+      glite.text("app"),
+      glite.text("/var/lib/app/git/app.git"),
+      glite.text("github:example/app"),
       glite.text("integrate"),
     ])
   conn
@@ -68,13 +68,13 @@ pub fn replace_an_agents_grants_atomically_test() {
   }
   let assert Ok(2) =
     put([
-      #("github", "uncle-samm/modorra", "write"),
-      #("git", "modorra", "push"),
+      #("github", "example/app", "write"),
+      #("git", "app", "push"),
     ])
   // A duplicate grant fails the whole replacement, keeping the old grants.
   let assert Error(glite.RolledBack(error.Constraint(error.PrimaryKey, _))) =
-    put([#("git", "modorra", "push"), #("git", "modorra", "read")])
-  let assert Ok(["git modorra push", "github uncle-samm/modorra write"]) =
+    put([#("git", "app", "push"), #("git", "app", "read")])
+  let assert Ok(["git app push", "github example/app write"]) =
     glite.query(
       conn,
       "SELECT kind || ' ' || scope || ' ' || permission FROM grants WHERE agent = ? ORDER BY kind",
@@ -103,7 +103,7 @@ pub fn queue_claims_a_batch_and_moves_state_once_test() {
   let assert Ok(2) =
     glite.exec_many(
       conn,
-      "INSERT INTO queue (project, branch, agent, purpose) VALUES ('modorra', ?, ?, ?)",
+      "INSERT INTO queue (project, branch, agent, purpose) VALUES ('app', ?, ?, ?)",
       [
         [glite.text("feat/a"), glite.text("a1"), glite.text("add a")],
         [glite.text("feat/b"), glite.text("a2"), glite.text("add b")],
@@ -121,7 +121,7 @@ pub fn queue_claims_a_batch_and_moves_state_once_test() {
     glite.query(
       conn,
       "UPDATE queue SET state = 'batched', batch = ? WHERE project = ? AND state = 'waiting' RETURNING branch",
-      [glite.int(1), glite.text("modorra")],
+      [glite.int(1), glite.text("app")],
       {
         use s <- decode.element(0, decode.text)
         decode.success(s)

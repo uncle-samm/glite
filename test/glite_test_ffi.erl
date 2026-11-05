@@ -1,5 +1,6 @@
 -module(glite_test_ffi).
--export([temp_path/1, delete_db/1, rescue/1, mailbox_size/0, analyze/1, kill_actor/1, queue_length/1, collect_garbage/0]).
+-export([temp_path/1, delete_db/1, rescue/1, mailbox_size/0, analyze/1, kill_actor/1, queue_length/1, collect_garbage/0,
+         esqlite_has_finalize/0, file_exists/1]).
 
 temp_path(Name) ->
     Dir = case os:getenv("TMPDIR") of false -> "/tmp"; D -> D end,
@@ -39,3 +40,12 @@ queue_length({direct, _Subject, {handle, _, _, Counters, _}}) ->
 collect_garbage() ->
     true = erlang:garbage_collect(),
     nil.
+
+%% glite finalizes statements through esqlite3_nif:finalize_query_statement/1,
+%% which esqlite doesn't document. Fail loudly if an esqlite upgrade drops it.
+esqlite_has_finalize() ->
+    {module, esqlite3_nif} = code:ensure_loaded(esqlite3_nif),
+    erlang:function_exported(esqlite3_nif, finalize_query_statement, 1).
+
+file_exists(Path) ->
+    filelib:is_file(Path).

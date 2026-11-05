@@ -512,6 +512,34 @@ pub fn backup_test() {
   let assert Ok(Nil) = glite.disconnect(conn)
 }
 
+pub fn failed_backup_leaves_no_file_test() {
+  use path <- helpers.with_file("source")
+  let assert Ok(conn) = glite.connect(config.new(path))
+  let assert Ok(Nil) = glite.exec_script(conn, "CREATE TABLE t (x)")
+  let target = path <> ".missing-dir/copy.db"
+  let assert Error(_) = glite.backup(conn, to: target)
+  let assert False = file_exists(target)
+  // The connection is free straight away.
+  let assert Ok(Nil) = glite.exec_script(conn, "INSERT INTO t VALUES (1)")
+  let assert Ok(Nil) = glite.disconnect(conn)
+}
+
+@external(erlang, "glite_test_ffi", "file_exists")
+fn file_exists(path: String) -> Bool
+
+// =============================================================================
+// esqlite internals glite depends on
+// =============================================================================
+
+pub fn esqlite_still_has_finalize_test() {
+  // glite.release/1 finalizes statements through this undocumented esqlite
+  // NIF (see glite_ffi.erl). If an esqlite upgrade removes it, fix release/1.
+  let assert True = esqlite_has_finalize()
+}
+
+@external(erlang, "glite_test_ffi", "esqlite_has_finalize")
+fn esqlite_has_finalize() -> Bool
+
 // =============================================================================
 // Supervision
 // =============================================================================

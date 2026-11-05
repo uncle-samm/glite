@@ -4,6 +4,7 @@ import gleam/int
 import gleam/io
 import gleam/json
 import gleam/list
+import gleam/result
 import gleam/string
 import gleamy/bench
 
@@ -103,7 +104,7 @@ pub fn report_to_json(report: BenchReport) -> String {
 /// Write a report to a JSON file
 pub fn write_report(report: BenchReport, path: String) -> Result(Nil, String) {
   let content = report_to_json(report)
-  let _ = write_file(path, content)
+  use Nil <- result.try(write_file(path, content))
   let commit_path =
     string.replace(path, ".json", "-" <> report.commit <> ".json")
   write_file(commit_path, content)

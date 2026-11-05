@@ -105,8 +105,15 @@ fn ffi_execute_many(
   max_batch: Int,
 ) -> Result(Int, Error)
 
+/// Write a copy of the database to `path` with `VACUUM INTO`. Runs in the
+/// actor.
 @external(erlang, "glite_ffi", "backup")
-pub fn backup(db: Db, path: String) -> Result(Int, Error)
+pub fn backup(db: Db, path: String) -> Result(Nil, Error)
+
+/// Check and fsync a copy written by `backup`, and return its size. Runs in
+/// the caller, so a slow check never holds up the connection.
+@external(erlang, "glite_ffi", "verify_backup")
+pub fn verify_backup(path: String) -> Result(Int, Error)
 
 pub fn query(
   db: Db,
@@ -136,16 +143,17 @@ pub fn query_one(
   params: List(Value),
   decoder: RowDecoder(a),
 ) -> Result(a, Error) {
-  use rows <- result.try(query_with(db, limits, sql, params, decoder))
-  case rows {
-    [row] -> Ok(row)
-    [] -> Error(error.Decode("expected one row, got none", row: 0, column: 0))
-    _ ->
-      Error(error.Decode(
-        "expected one row, got " <> int.to_string(list.length(rows)),
-        row: 1,
-        column: 0,
-      ))
+  // Fetch at most one row: a second one is an error, so there is no need to
+  // read the rest of the result.
+  let one = Limits(..limits, max_rows: 1)
+  case query_with(db, one, sql, params, decoder) {
+    Ok([row]) -> Ok(row)
+    Ok([]) ->
+      Error(error.Decode("expected one row, got none", row: 0, column: 0))
+    Ok(_) -> panic as "glite: a query limited to one row returned more"
+    Error(error.RowLimitExceeded(_)) ->
+      Error(error.Decode("expected one row, got more", row: 1, column: 0))
+    Error(e) -> Error(e)
   }
 }
 

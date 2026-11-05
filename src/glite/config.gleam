@@ -5,7 +5,7 @@
 ////
 //// ```gleam
 //// let config =
-////   config.new("/var/lib/modorra/state.db")
+////   config.new("/var/lib/myapp/app.db")
 ////   |> config.call_timeout_ms(5000)
 ////   |> config.max_rows(1000)
 //// ```

@@ -7,7 +7,7 @@
 
 -export([
     open/1, close/1, autocommit/1, interrupt/1,
-    exec_script/2, execute/3, query/4, execute_many/4, backup/2,
+    exec_script/2, execute/3, query/4, execute_many/4, backup/2, verify_backup/1,
     analyze/1,
     protect/1, coerce/1,
     new_counters/0, admit/2, dequeued/1, begin_request/3, end_request/2,
@@ -261,20 +261,39 @@ total_changes(Db) ->
 %% Backup
 %% =============================================================================
 
-%% Write a consistent copy of the database to Path with VACUUM INTO, check the
-%% copy with PRAGMA integrity_check, fsync it, and return its size in bytes.
+%% Write a consistent copy of the database to Path with VACUUM INTO. This is
+%% the only part of a backup that runs in the connection actor: checking and
+%% syncing the copy uses its own handle, which a timed-out call can't
+%% interrupt, so verify_backup/1 runs in the caller instead.
+%%
+%% If VACUUM INTO fails or is interrupted, the partial file it may leave is
+%% deleted, so the same target can be tried again.
 backup(Db, Path) ->
     case filelib:is_file(Path) of
         true ->
             {error, {backup, <<"the target already exists: ", Path/binary>>}};
         false ->
             case execute(Db, <<"VACUUM INTO ?">>, [{text, Path}]) of
-                {error, _} = Error -> Error;
-                {ok, _} -> verify_backup(Path)
+                {ok, _} ->
+                    {ok, nil};
+                {error, _} = Error ->
+                    _ = file:delete(Path),
+                    Error
             end
     end.
 
+%% Check a copy written by backup/2 with PRAGMA integrity_check, fsync it, and
+%% return its size in bytes. A copy that fails either step is deleted.
 verify_backup(Path) ->
+    case check_copy(Path) of
+        {ok, _} = Ok ->
+            Ok;
+        {error, _} = Error ->
+            _ = file:delete(Path),
+            Error
+    end.
+
+check_copy(Path) ->
     case esqlite3:open(unicode:characters_to_list(Path)) of
         {error, _} ->
             {error, {backup, <<"could not open the copy: ", Path/binary>>}};

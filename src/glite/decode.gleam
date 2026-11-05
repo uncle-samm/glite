@@ -1,5 +1,8 @@
 //// Decoders that turn a result row into a typed value.
 ////
+//// If you also use `gleam/dynamic/decode`, import this module under another
+//// name, such as `import glite/decode as row`.
+////
 //// ```gleam
 //// import glite/decode
 ////
@@ -66,6 +69,49 @@ pub fn element(
 /// Finish a decoder with a value.
 pub fn success(value: a) -> RowDecoder(a) {
   RowDecoder(fn(_row) { Ok(value) })
+}
+
+/// Change a decoded value with `f`.
+///
+/// ```gleam
+/// let name_length = decode.map(name_decoder, string.length)
+/// ```
+pub fn map(decoder: RowDecoder(a), with f: fn(a) -> b) -> RowDecoder(b) {
+  RowDecoder(fn(row) {
+    case decoder.run(row) {
+      Ok(value) -> Ok(f(value))
+      Error(failure) -> Error(failure)
+    }
+  })
+}
+
+/// Decode the row with `decoder`, then decode the same row again with the
+/// decoder `next` picks from the result. For rows whose shape depends on a
+/// column, such as a `kind` column that says which other columns are set.
+///
+/// ```gleam
+/// use kind <- decode.then(kind_decoder)
+/// case kind {
+///   "circle" -> circle_decoder
+///   _ -> square_decoder
+/// }
+/// ```
+pub fn then(
+  decoder: RowDecoder(a),
+  next: fn(a) -> RowDecoder(b),
+) -> RowDecoder(b) {
+  RowDecoder(fn(row) {
+    case decoder.run(row) {
+      Ok(value) -> next(value).run(row)
+      Error(failure) -> Error(failure)
+    }
+  })
+}
+
+/// A decoder that always fails with `message`, reported at `column`. Use it
+/// in `then` for a value no decoder should accept.
+pub fn fail(message: String, at column: Int) -> RowDecoder(a) {
+  RowDecoder(fn(_row) { Error(Failure(message, column)) })
 }
 
 /// An integer.

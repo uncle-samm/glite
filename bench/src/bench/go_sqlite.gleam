@@ -1,7 +1,9 @@
 //// The "simple" test from go-sqlite-bench
 //// (https://github.com/cvilsmeier/go-sqlite-bench): insert N users in one
-//// transaction, then read them all back, with journal_mode=DELETE and
-//// synchronous=FULL as in the original.
+//// transaction, then read them all back. The original runs on a file with
+//// journal_mode=DELETE and synchronous=FULL; this runs in memory, so it
+//// measures glite's and SQLite's CPU cost without disk I/O, and its numbers
+//// are not directly comparable with the published go-sqlite-bench results.
 
 import bench_baseline
 import gleam/dict

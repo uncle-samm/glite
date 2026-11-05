@@ -11,7 +11,7 @@ jobs:
   publish:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: erlef/setup-beam@v1
         with:
           otp-version: "29"
@@ -33,9 +33,8 @@ jobs:
             echo "Add a HEXPM_API_KEY secret in Settings > Secrets and variables > Actions." >&2
             exit 1
           fi
-      - run: gleam format --check src test
-      - run: gleam build --warnings-as-errors
-      - run: gleam test
+      - run: gleam deps download
+      - run: make check
       - name: Publish to Hex
         env:
           HEXPM_API_KEY: ${{ secrets.HEXPM_API_KEY }}

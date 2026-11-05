@@ -1,5 +1,7 @@
-import gleam/dynamic.{type Dynamic}
 import gleam/erlang/process
+import gleam/result
+import glite/error
+import glite/internal/sql
 
 @external(erlang, "glite_test_ffi", "temp_path")
 pub fn temp_path(name: String) -> String
@@ -18,8 +20,16 @@ pub fn collect_garbage() -> Nil
 @external(erlang, "glite_test_ffi", "mailbox_size")
 pub fn mailbox_size() -> Int
 
-@external(erlang, "glite_test_ffi", "analyze")
-pub fn analyze(sql: String) -> Result(#(Int, String), Dynamic)
+/// The scanner's verdict on `sql`: its parameter count and kind.
+pub fn analyze(sql: String) -> Result(#(Int, String), error.Error) {
+  use analysis <- result.map(sql.analyze(sql))
+  let kind = case analysis.kind {
+    sql.Dml -> "dml"
+    sql.With -> "with"
+    sql.Other -> "other"
+  }
+  #(analysis.params, kind)
+}
 
 /// Give `f` a fresh database path, and delete the files afterwards.
 pub fn with_file(name: String, f: fn(String) -> a) -> a {

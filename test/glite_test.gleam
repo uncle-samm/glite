@@ -1,4 +1,5 @@
 import gleam/option.{None, Some}
+import gleam/string
 import gleeunit
 import glite
 import glite/config
@@ -166,6 +167,71 @@ pub fn query_one_needs_exactly_one_row_test() {
     ])
   let assert Error(error.Decode(..)) =
     glite.query_one(conn, "SELECT id FROM users", [], int_column())
+}
+
+pub fn query_one_reads_at_most_two_rows_test() {
+  // More rows than max_rows is still "more than one", not RowLimitExceeded:
+  // query_one stops reading at the second row.
+  let assert Ok(conn) = glite.connect(config.memory() |> config.max_rows(2))
+  let assert Ok(Nil) = glite.exec_script(conn, "CREATE TABLE t (x INTEGER)")
+  let assert Ok(5) =
+    glite.exec_many(conn, "INSERT INTO t VALUES (?)", [
+      [glite.int(1)],
+      [glite.int(2)],
+      [glite.int(3)],
+      [glite.int(4)],
+      [glite.int(5)],
+    ])
+  let assert Error(error.Decode(message:, row: 1, ..)) =
+    glite.query_one(conn, "SELECT x FROM t", [], int_column())
+  let assert "expected one row, got more" = message
+  let assert Ok(3) =
+    glite.query_one(conn, "SELECT x FROM t WHERE x = 3", [], int_column())
+  let assert Ok(Nil) = glite.disconnect(conn)
+}
+
+pub fn decode_map_and_then_test() {
+  let conn = users()
+  let assert Ok(2) =
+    glite.exec_many(conn, "INSERT INTO users (name, email) VALUES (?, ?)", [
+      [glite.text("ann"), glite.text("ann@example.com")],
+      [glite.text("bob"), glite.null()],
+    ])
+  // map
+  let assert Ok([3, 3]) =
+    glite.query(
+      conn,
+      "SELECT name FROM users ORDER BY id",
+      [],
+      decode.map(text_column(), string.length),
+    )
+  // then: the second column decides how the rest of the row is read.
+  let contact = {
+    use has_email <- decode.then({
+      use email <- decode.element(1, decode.optional(decode.text))
+      decode.success(email != None)
+    })
+    case has_email {
+      True -> {
+        use email <- decode.element(1, decode.text)
+        decode.success(email)
+      }
+      False -> {
+        use name <- decode.element(0, decode.text)
+        decode.success("no email for " <> name)
+      }
+    }
+  }
+  let assert Ok(["ann@example.com", "no email for bob"]) =
+    glite.query(conn, "SELECT name, email FROM users ORDER BY id", [], contact)
+  // fail reports the column it was given.
+  let assert Error(error.Decode(message: "nope", row: 0, column: 1)) =
+    glite.query(
+      conn,
+      "SELECT name, email FROM users ORDER BY id",
+      [],
+      decode.fail("nope", at: 1),
+    )
 }
 
 pub fn decode_error_names_row_and_column_test() {

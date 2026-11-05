@@ -14,19 +14,34 @@ jobs:
       matrix:
         otp: ["28", "29"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: erlef/setup-beam@v1
         with:
           otp-version: ${{ matrix.otp }}
           gleam-version: "1.19.2"
           rebar3-version: "3"
-      - run: gleam format --check src test bench/src
       - run: gleam deps download
-      - run: gleam build --warnings-as-errors
-      - name: Compile the Erlang FFI with warnings as errors
-        run: erlc +warnings_as_errors -o "$RUNNER_TEMP" src/glite_ffi.erl
-      - run: gleam test
-      - run: gleam docs build
-      - name: Benchmarks compile
-        working-directory: bench
-        run: gleam build --warnings-as-errors
+      - name: Formatting (shows the diff if anything is unformatted)
+        run: gleam format src test bench/src && git diff --exit-code
+      # The same checks as `make check` locally: format, warnings as errors
+      # (Gleam and the Erlang FFI), tests, docs, and the benchmarks compile.
+      - run: make check
+
+  bench:
+    name: Benchmarks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "29"
+          gleam-version: "1.19.2"
+          rebar3-version: "3"
+      - run: mkdir -p bench/results
+      - run: make bench
+      # Numbers from shared CI runners are noisy: use them to spot large
+      # regressions and for the glite/sqlight ratio, not as absolute figures.
+      - uses: actions/upload-artifact@v5
+        with:
+          name: bench-results
+          path: bench/results/

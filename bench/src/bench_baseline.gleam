@@ -1,9 +1,13 @@
 /// Benchmark baseline comparison.
 /// Saves results after each run and compares against the previous baseline.
 import gleam/dict.{type Dict}
+import gleam/dynamic/decode
 import gleam/float
 import gleam/int
 import gleam/io
+import gleam/json
+import gleam/result
+import simplifile
 
 pub type BenchResults =
   Dict(String, Int)
@@ -12,8 +16,10 @@ pub type BenchResults =
 pub fn compare_and_save(path: String, results: BenchResults) -> Nil {
   let prev = load_baseline(path)
   print_comparison(prev, results)
-  let _ = save_baseline(path, results)
-  Nil
+  case save_baseline(path, results) {
+    Ok(Nil) -> Nil
+    Error(e) -> io.println("  [baseline] Could not save the baseline: " <> e)
+  }
 }
 
 fn print_comparison(
@@ -83,8 +89,18 @@ fn float_to_string_1dp(f: Float) -> String {
   sign <> int.to_string(whole) <> "." <> int.to_string(frac)
 }
 
-@external(erlang, "bench_baseline_ffi", "load_baseline")
-fn load_baseline(path: String) -> Result(BenchResults, String)
+fn load_baseline(path: String) -> Result(BenchResults, String) {
+  use content <- result.try(
+    simplifile.read(from: path) |> result.replace_error("no baseline found"),
+  )
+  json.parse(content, decode.dict(decode.string, decode.int))
+  |> result.replace_error("invalid baseline format")
+}
 
-@external(erlang, "bench_baseline_ffi", "save_baseline")
-fn save_baseline(path: String, results: BenchResults) -> Result(Nil, String)
+fn save_baseline(path: String, results: BenchResults) -> Result(Nil, String) {
+  let content =
+    json.dict(results, fn(key) { key }, json.int)
+    |> json.to_string
+  simplifile.write(to: path, contents: content)
+  |> result.map_error(simplifile.describe_error)
+}

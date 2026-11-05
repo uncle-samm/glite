@@ -1,11 +1,16 @@
 /// Benchmark harness — extracts stats from gleamy_bench results and writes JSON.
+import envoy
 import gleam/float
 import gleam/int
 import gleam/io
 import gleam/json
 import gleam/list
+import gleam/result
 import gleam/string
+import gleam/time/calendar
+import gleam/time/timestamp
 import gleamy/bench
+import simplifile
 
 /// A single benchmark result with computed statistics
 pub type BenchmarkResult {
@@ -103,7 +108,7 @@ pub fn report_to_json(report: BenchReport) -> String {
 /// Write a report to a JSON file
 pub fn write_report(report: BenchReport, path: String) -> Result(Nil, String) {
   let content = report_to_json(report)
-  let _ = write_file(path, content)
+  use Nil <- result.try(write_file(path, content))
   let commit_path =
     string.replace(path, ".json", "-" <> report.commit <> ".json")
   write_file(commit_path, content)
@@ -221,14 +226,25 @@ fn insert_commas_loop(
 // FFI
 // =============================================================================
 
-@external(erlang, "bench_ffi", "git_commit_hash")
-fn git_commit_hash() -> String
+/// The commit being measured: `GIT_COMMIT` if it is set (the Makefile sets
+/// it), otherwise "local".
+fn git_commit_hash() -> String {
+  case envoy.get("GIT_COMMIT") {
+    Ok(commit) if commit != "" -> commit
+    _ -> "local"
+  }
+}
 
-@external(erlang, "bench_ffi", "timestamp_iso8601")
-fn timestamp_iso8601() -> String
+fn timestamp_iso8601() -> String {
+  timestamp.system_time() |> timestamp.to_rfc3339(calendar.utc_offset)
+}
 
-@external(erlang, "bench_ffi", "write_file")
-fn write_file(path: String, content: String) -> Result(Nil, String)
+fn write_file(path: String, content: String) -> Result(Nil, String) {
+  simplifile.write(to: path, contents: content)
+  |> result.map_error(simplifile.describe_error)
+}
 
-@external(erlang, "bench_ffi", "read_file")
-pub fn read_file(path: String) -> Result(String, String)
+pub fn read_file(path: String) -> Result(String, String) {
+  simplifile.read(from: path)
+  |> result.map_error(simplifile.describe_error)
+}

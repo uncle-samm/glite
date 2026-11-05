@@ -1,13 +1,16 @@
 //// The "simple" test from go-sqlite-bench
 //// (https://github.com/cvilsmeier/go-sqlite-bench): insert N users in one
-//// transaction, then read them all back, with journal_mode=DELETE and
-//// synchronous=FULL as in the original.
+//// transaction, then read them all back. The original runs on a file with
+//// journal_mode=DELETE and synchronous=FULL; this runs in memory, so it
+//// measures glite's and SQLite's CPU cost without disk I/O, and its numbers
+//// are not directly comparable with the published go-sqlite-bench results.
 
 import bench_baseline
 import gleam/dict
 import gleam/int
 import gleam/io
 import gleam/list
+import gleam/time/timestamp
 import glite
 import glite/config
 import glite/decode
@@ -70,7 +73,7 @@ pub fn run(n: Int) -> Nil {
     <> " ms",
   )
   bench_baseline.compare_and_save(
-    "results/go_sqlite_baseline.terms",
+    "results/go_sqlite_baseline.json",
     dict.from_list([#("insert_ms", insert_ms), #("query_ms", query_ms)]),
   )
 }
@@ -94,5 +97,8 @@ fn insert_users(t: Tx, i: Int, n: Int) -> Result(Nil, error.Error) {
   }
 }
 
-@external(erlang, "bench_baseline_ffi", "now_ms")
-fn now_ms() -> Int
+fn now_ms() -> Int {
+  let #(seconds, nanoseconds) =
+    timestamp.system_time() |> timestamp.to_unix_seconds_and_nanoseconds
+  seconds * 1000 + nanoseconds / 1_000_000
+}

@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.4.0 - 2026-11-05
+
+### Fixed
+
+- `backup` no longer holds the connection while it checks the copy. The
+  integrity check ran on a second SQLite handle that a timed-out call
+  couldn't interrupt, so on a large database the caller got `Timeout` while
+  the connection stayed busy and every other caller queued behind it. The
+  check and the fsync now run in the calling process after the copy is made.
+- A backup that fails, is interrupted, or doesn't pass its check is deleted,
+  so the same path can be tried again instead of failing with "the target
+  already exists".
+- `query_one` stops reading at the second row instead of reading up to
+  `max_rows` rows first. More than one row is still a `Decode` error, now
+  also when the query matches more than `max_rows` rows.
+
+### Added
+
+- `decode.map`, `decode.then` and `decode.fail`.
+- A benchmark comparing glite with sqlight (`make bench-sqlight`), run in CI
+  on every push, and a Performance section in the README.
+- A test that fails if esqlite drops the undocumented NIF glite uses to
+  finalize statements.
+
+### Changed
+
+- Less Erlang. The SQL scanner, the parameter checks, turning cells into
+  values and naming SQLite errors are now Gleam (`glite/internal/sql` and
+  `glite/internal/db`). What is left in Erlang is the esqlite calls
+  (`glite_sqlite_ffi`) and the actor's process plumbing (`glite_ffi`):
+  atomic counters, reply aliases, re-raising a panic with its stacktrace,
+  `persistent_term` and monotonic time, none of which Gleam's libraries
+  offer. The benchmarks no longer use any Erlang: they use argv, envoy,
+  gleam_time and simplifile, and the go-sqlite baseline is JSON.
+- The README says what a timeout can't interrupt inside a transaction body,
+  and adds requirements, error handling, `exec_many` and a comparison with
+  sqlight.
+- `make check` now runs everything CI and the release workflow run, and both
+  workflows call it.
+
 ## v0.3.1 - 2026-11-05
 
 ### Fixed

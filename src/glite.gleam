@@ -199,7 +199,8 @@ pub fn query(
 }
 
 /// Run a query that returns exactly one row, and decode it. No rows, or more
-/// than one, is a `Decode` error.
+/// than one, is a `Decode` error. It stops reading at the second row, so it
+/// is cheap even on a query that matches many.
 pub fn query_one(
   conn: Connection,
   sql: String,
@@ -229,6 +230,11 @@ pub fn query_rows(
 /// The whole transaction must finish within `call_timeout_ms`. If it
 /// doesn't, its running statement is interrupted, it is rolled back, and the
 /// result is `Database(Timeout(_))`.
+///
+/// A timeout can interrupt SQL but nothing else. A body that waits for a
+/// message, loops, or calls a slow service keeps the connection busy until it
+/// returns, so keep the body to statements on the `Tx` and quick Gleam code,
+/// and never call another glite connection from it.
 pub fn transaction(
   conn: Connection,
   mode: TransactionMode,
@@ -284,9 +290,19 @@ pub fn set_user_version(conn: Connection, version: Int) -> Result(Nil, Error) {
 
 /// Write a consistent copy of the database to `path` with `VACUUM INTO`,
 /// check the copy with `PRAGMA integrity_check`, and fsync it. `path` must
-/// not exist yet. Writers wait while the copy is made.
+/// not exist yet.
+///
+/// Only the copy runs on the connection, within `call_timeout_ms`; writers
+/// wait while it is made. The check and the fsync run in the calling process
+/// afterwards, so they never hold up the connection, and they take as long as
+/// the database's size needs. A copy that fails, is interrupted, or doesn't
+/// pass the check is deleted, so the same path can be tried again.
+///
+/// Never pass a path that came from user input: the copy is written wherever
+/// the VM can write.
 pub fn backup(conn: Connection, to path: String) -> Result(Backup, Error) {
-  use bytes <- result.map(run(conn, fn(db, _limits) { db.backup(db, path) }))
+  use Nil <- result.try(run(conn, fn(db, _limits) { db.backup(db, path) }))
+  use bytes <- result.map(db.verify_backup(path))
   Backup(path:, bytes:)
 }
 

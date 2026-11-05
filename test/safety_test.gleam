@@ -125,6 +125,30 @@ pub fn scanner_test() {
   let assert Error(_) = helpers.analyze("SELECT 1; SELECT 2")
   let assert Error(_) = helpers.analyze("BEGIN; DELETE FROM t")
   let assert Error(_) = helpers.analyze(" ; ")
+  let assert Error(_) = helpers.analyze("")
+  // Semicolons inside a trigger body, and CASE ... END, don't end it.
+  let assert Ok(#(0, "other")) =
+    helpers.analyze(
+      "CREATE TRIGGER t AFTER INSERT ON a BEGIN
+         UPDATE b SET n = CASE WHEN n > 0 THEN n + 1 ELSE 1 END;
+         DELETE FROM c;
+       END;",
+    )
+  let assert Ok(#(0, "other")) =
+    helpers.analyze(
+      "CREATE TEMP TRIGGER t AFTER INSERT ON a BEGIN SELECT 1; END",
+    )
+  let assert Error(_) =
+    helpers.analyze(
+      "CREATE TRIGGER t AFTER INSERT ON a BEGIN SELECT 1; END; SELECT 2",
+    )
+  // ?NNN and names share one numbering: :a after ?5 is parameter 6.
+  let assert Ok(#(6, "other")) = helpers.analyze("SELECT ?5, :a, :a")
+  let assert Ok(#(1, "dml")) = helpers.analyze("REPLACE INTO t VALUES ($x)")
+  let assert Ok(#(0, "other")) = helpers.analyze("SELECT x'00ff', 1.5e+10")
+  // Non-ASCII identifiers and text.
+  let assert Ok(#(1, "other")) =
+    helpers.analyze("SELECT 'é;', ü FROM t WHERE ö = ?")
 }
 
 // =============================================================================
@@ -511,6 +535,34 @@ pub fn backup_test() {
   let assert Error(error.Backup(_)) = glite.backup(conn, to: copy)
   let assert Ok(Nil) = glite.disconnect(conn)
 }
+
+pub fn failed_backup_leaves_no_file_test() {
+  use path <- helpers.with_file("source")
+  let assert Ok(conn) = glite.connect(config.new(path))
+  let assert Ok(Nil) = glite.exec_script(conn, "CREATE TABLE t (x)")
+  let target = path <> ".missing-dir/copy.db"
+  let assert Error(_) = glite.backup(conn, to: target)
+  let assert False = file_exists(target)
+  // The connection is free straight away.
+  let assert Ok(Nil) = glite.exec_script(conn, "INSERT INTO t VALUES (1)")
+  let assert Ok(Nil) = glite.disconnect(conn)
+}
+
+@external(erlang, "glite_test_ffi", "file_exists")
+fn file_exists(path: String) -> Bool
+
+// =============================================================================
+// esqlite internals glite depends on
+// =============================================================================
+
+pub fn esqlite_still_has_finalize_test() {
+  // glite.release/1 finalizes statements through this undocumented esqlite
+  // NIF (see glite_ffi.erl). If an esqlite upgrade removes it, fix release/1.
+  let assert True = esqlite_has_finalize()
+}
+
+@external(erlang, "glite_test_ffi", "esqlite_has_finalize")
+fn esqlite_has_finalize() -> Bool
 
 // =============================================================================
 // Supervision

@@ -149,7 +149,18 @@ esqlite returns TEXT and BLOB cells the same way, so glite tells them apart by t
 
 `make bench-sqlight` runs the same operations through both packages; CI runs it on every push and keeps the results as a build artifact.
 
-PERFORMANCE_TABLE
+Mean time per operation on an in-memory database, from one CI run (GitHub's ubuntu-24.04 runner, OTP 29). Shared runners are noisy, so read the ratios, not the absolute numbers.
+
+| Operation | glite | sqlight | glite / sqlight |
+| --- | ---: | ---: | ---: |
+| `SELECT ?` with one parameter | 20 µs | 26 µs | about the same (noise) |
+| Insert one row | 17 µs | 8 µs | 2.2× |
+| Select and decode 100 rows | 288 µs | 268 µs | 1.1× |
+| Select and decode 1,000 rows | 2.5 ms | 2.6 ms | about the same |
+| Transaction with 100 inserts | 1.05 ms | 0.63 ms | 1.7× |
+| 8 processes × 50 selects at once | 6.9 ms | 4.7 ms | 1.5× |
+
+The actor costs about 10 µs per call. That shows on tiny statements and on transactions of many small statements, and is lost in the noise once a query does real work. Under concurrency glite serializes every call through one actor, while sqlight's callers contend on SQLite's own lock; with WAL, a pool of read connections would close that gap.
 
 ## Development
 

@@ -41,7 +41,7 @@ jobs:
       - run: make bench
       # Numbers from shared CI runners are noisy: use them to spot large
       # regressions and for the glite/sqlight ratio, not as absolute figures.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: bench-results
           path: bench/results/

@@ -1,11 +1,11 @@
 name: Release
 
-# Pushing a tag such as v0.3.0 tests the code and publishes that version to
-# Hex. The tag must match the version in gleam.toml. Needs the HEXPM_API_KEY
-# repository secret.
+# Publishing a GitHub release tests the code at the release's tag and
+# publishes that version to Hex. The tag must be "v" plus the version in
+# gleam.toml, such as v0.4.0. Needs the HEXPM_API_KEY repository secret.
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
 
 jobs:
   publish:
@@ -18,11 +18,13 @@ jobs:
           gleam-version: "1.19.2"
           rebar3-version: "3"
       - name: Check the tag matches gleam.toml
+        env:
+          TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' gleam.toml)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match gleam.toml version $version." >&2
+          if [ "v$version" != "$TAG" ]; then
+            echo "Release tag $TAG does not match gleam.toml version $version." >&2
             exit 1
           fi
       - name: Check the Hex key is set

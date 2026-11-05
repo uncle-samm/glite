@@ -167,5 +167,6 @@ The actor costs about 10 µs per call. That shows on tiny statements and on tran
 ```sh
 make check     # what CI runs: format, warnings as errors, tests, docs, benchmarks compile
 make bench     # benchmarks, in the bench/ project, including the sqlight comparison
-make release   # tag the version in gleam.toml; CI publishes it to Hex
 ```
+
+To release, set the new version in `gleam.toml` and `CHANGELOG.md` and merge to `main`. Then publish a GitHub release on `main` whose tag is `v` plus that version, such as `v0.4.0`, with the CHANGELOG entry as its notes. The Release workflow checks the tag matches `gleam.toml`, runs `make check`, and publishes to Hex.

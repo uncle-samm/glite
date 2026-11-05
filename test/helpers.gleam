@@ -11,6 +11,10 @@ pub fn delete_db(path: String) -> Nil
 @external(erlang, "glite_test_ffi", "rescue")
 pub fn rescue(f: fn() -> a) -> Result(a, String)
 
+/// Run a garbage collection of the calling process now.
+@external(erlang, "glite_test_ffi", "collect_garbage")
+pub fn collect_garbage() -> Nil
+
 @external(erlang, "glite_test_ffi", "mailbox_size")
 pub fn mailbox_size() -> Int
 

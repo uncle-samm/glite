@@ -233,6 +233,31 @@ pub fn timed_out_transaction_is_rolled_back_test() {
     glite.query_one(conn, "SELECT count(*) FROM t", [], int_column())
 }
 
+// A statement left to the garbage collector is finalized by a resource
+// destructor that runs later on a normal scheduler and takes the connection's
+// mutex. In 0.3.0 that could happen while the actor ran a slow statement on
+// the same connection: the scheduler blocked until the statement ended, its
+// timers stopped, and the timeout never fired.
+pub fn finished_statements_never_block_a_scheduler_test() {
+  let assert Ok(conn) =
+    glite.connect(
+      config.memory()
+      |> config.busy_timeout_ms(50)
+      |> config.call_timeout_ms(100),
+    )
+  let assert Ok(Nil) = glite.exec_script(conn, "CREATE TABLE t (x)")
+  ints(1, 10)
+  |> list.each(fn(_) {
+    let assert Error(glite.Database(error.Timeout(100))) =
+      glite.transaction(conn, glite.Immediate, fn(t) {
+        let assert Ok(1) = tx.exec(t, "INSERT INTO t VALUES (1)", [])
+        tx.query(t, slow_sql, [], int_column())
+      })
+  })
+  let assert Ok(0) =
+    glite.query_one(conn, "SELECT count(*) FROM t", [], int_column())
+}
+
 pub fn queued_call_that_timed_out_never_runs_test() {
   let assert Ok(conn) =
     glite.connect(

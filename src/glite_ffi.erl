@@ -77,7 +77,7 @@ execute(Db, Sql, Params) ->
                     {error, _} = Error -> Error
                 end
             after
-                esqlite3:reset(Stmt)
+                release(Stmt)
             end;
         {error, _} = Error ->
             Error
@@ -101,7 +101,7 @@ query(Db, Sql, Params, MaxRows) ->
                         {error, sqlite_error(Db, Code)}
                 end
             after
-                esqlite3:reset(Stmt)
+                release(Stmt)
             end;
         {error, _} = Error ->
             Error
@@ -138,7 +138,7 @@ run_batch(Db, Sql, Kind, ArgsList) ->
             try
                 run_batch_loop(Db, Stmt, Kind, ArgsList, 0)
             after
-                esqlite3:reset(Stmt)
+                release(Stmt)
             end
     end.
 
@@ -154,6 +154,16 @@ run_batch_loop(Db, Stmt, Kind, [Args | Rest], Total) ->
         {error, _} = Error ->
             Error
     end.
+
+%% Finalize a statement as soon as glite is done with it. Left to the garbage
+%% collector, esqlite finalizes it in a resource destructor that the runtime
+%% runs later, on a normal scheduler, and that takes the connection's mutex.
+%% If the actor is running a long statement on the same connection by then,
+%% that scheduler blocks until the statement ends, and its timers with it, so
+%% a call's timeout never fires. esqlite3 doesn't export a finalize function;
+%% this is the NIF its own q/2 uses to finalize its statements eagerly.
+release({esqlite3_stmt, Ref}) ->
+    ok = esqlite3_nif:finalize_query_statement(Ref).
 
 reset_ok(_Db, ok) -> ok;
 reset_ok(Db, {error, Code}) -> erlang:error({glite_reset_failed, sqlite_error(Db, Code)}).

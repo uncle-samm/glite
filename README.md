@@ -133,9 +133,16 @@ Parameters are built with `glite.int`, `float`, `text`, `blob`, `bool` (stored a
 
 esqlite returns TEXT and BLOB cells the same way, so glite tells them apart by the column's declared type: a column declared with `BLOB` in its type returns `Blob`. Anything that isn't valid UTF-8 is always `Blob`, so a `String` never holds invalid UTF-8, and `decode.blob` accepts text as well.
 
-## glite or sqlight?
+## Other Gleam SQLite packages
 
-[sqlight](https://hex.pm/packages/sqlight) is the other SQLite package for Gleam on Erlang. Both call SQLite from the calling process. sqlight is smaller and leaves sharing a connection safely to you. glite adds isolated transactions that other processes can't interleave with, timeouts that interrupt the running statement, a bounded queue, recovery from callers that die, typed errors and a statement cache. Pick sqlight for scripts and single-process use, and glite when many processes share a database in a long-running service.
+[sqlight](https://hex.pm/packages/sqlight) is the most used SQLite package for Gleam. Both call SQLite from the calling process, and both return SQLite's error codes as typed values. sqlight is smaller, also runs on JavaScript (Node and Deno), and leaves sharing a connection between processes safely to you. glite runs on Erlang only, and adds isolated transactions that other processes can't interleave with, timeouts that interrupt the running statement, a bounded queue, recovery from callers that die, a statement cache, named constraint failures, and checks on the SQL and parameters before they run. Pick sqlight for scripts, single-process use or JavaScript, and glite when many processes share a database in a long-running service.
+
+Other packages, as of November 2026:
+
+- [pturso](https://hex.pm/packages/pturso) talks to SQLite through a Turso port program instead of a NIF, so it works on statically linked BEAM builds.
+- [spaceship_db](https://hex.pm/packages/spaceship_db) is for JavaScript: SQLite, Cloudflare D1 and Turso behind one API.
+- [glimr_sqlite](https://hex.pm/packages/glimr_sqlite) is the SQLite driver of the Glimr web framework, built on sqlight.
+- [marmot](https://hex.pm/packages/marmot), [parrot](https://hex.pm/packages/parrot), [cake](https://hex.pm/packages/cake) and [gloo](https://hex.pm/packages/gloo) generate typed functions from SQL or build queries. They sit on top of a driver, mostly sqlight, rather than replace one.
 
 ## Performance
 

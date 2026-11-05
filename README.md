@@ -139,7 +139,7 @@ esqlite returns TEXT and BLOB cells the same way, so glite tells them apart by t
 
 Other packages, as of November 2026:
 
-- [pturso](https://hex.pm/packages/pturso) talks to SQLite through a Turso port program instead of a NIF, so it works on statically linked BEAM builds.
+- [pturso](https://hex.pm/packages/pturso) is a client for [Turso](https://github.com/tursodatabase/turso), a SQLite-compatible database engine, run as an external Rust process over an Erlang port instead of a NIF, so it works on statically linked BEAM builds.
 - [spaceship_db](https://hex.pm/packages/spaceship_db) is for JavaScript: SQLite, Cloudflare D1 and Turso behind one API.
 - [glimr_sqlite](https://hex.pm/packages/glimr_sqlite) is the SQLite driver of the Glimr web framework, built on sqlight.
 - [marmot](https://hex.pm/packages/marmot), [parrot](https://hex.pm/packages/parrot), [cake](https://hex.pm/packages/cake) and [gloo](https://hex.pm/packages/gloo) generate typed functions from SQL or build queries. They sit on top of a driver, mostly sqlight, rather than replace one.

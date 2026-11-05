@@ -1,3 +1,6 @@
+# The commit the benchmarks report.
+export GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null)
+
 .PHONY: build test format check docs release bench bench-integration bench-sqlight bench-go-sqlite bench-compare
 
 build:
@@ -13,7 +16,7 @@ format:
 check:
 	gleam format --check src test bench/src
 	gleam build --warnings-as-errors
-	erlc +warnings_as_errors -o build src/glite_ffi.erl
+	erlc +warnings_as_errors -o build src/*.erl
 	gleam test
 	gleam docs build
 	cd bench && gleam build --warnings-as-errors

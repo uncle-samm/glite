@@ -6,7 +6,11 @@ import gleam/json
 import gleam/list
 import gleam/result
 import gleam/string
+import envoy
+import gleam/time/calendar
+import gleam/time/timestamp
 import gleamy/bench
+import simplifile
 
 /// A single benchmark result with computed statistics
 pub type BenchmarkResult {
@@ -222,14 +226,25 @@ fn insert_commas_loop(
 // FFI
 // =============================================================================
 
-@external(erlang, "bench_ffi", "git_commit_hash")
-fn git_commit_hash() -> String
+/// The commit being measured: `GIT_COMMIT` if it is set (the Makefile sets
+/// it), otherwise "local".
+fn git_commit_hash() -> String {
+  case envoy.get("GIT_COMMIT") {
+    Ok(commit) if commit != "" -> commit
+    _ -> "local"
+  }
+}
 
-@external(erlang, "bench_ffi", "timestamp_iso8601")
-fn timestamp_iso8601() -> String
+fn timestamp_iso8601() -> String {
+  timestamp.system_time() |> timestamp.to_rfc3339(calendar.utc_offset)
+}
 
-@external(erlang, "bench_ffi", "write_file")
-fn write_file(path: String, content: String) -> Result(Nil, String)
+fn write_file(path: String, content: String) -> Result(Nil, String) {
+  simplifile.write(to: path, contents: content)
+  |> result.map_error(simplifile.describe_error)
+}
 
-@external(erlang, "bench_ffi", "read_file")
-pub fn read_file(path: String) -> Result(String, String)
+pub fn read_file(path: String) -> Result(String, String) {
+  simplifile.read(from: path)
+  |> result.map_error(simplifile.describe_error)
+}

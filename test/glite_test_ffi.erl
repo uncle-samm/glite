@@ -1,5 +1,5 @@
 -module(glite_test_ffi).
--export([temp_path/1, delete_db/1, rescue/1, mailbox_size/0, analyze/1, kill_actor/1, queue_length/1, collect_garbage/0,
+-export([temp_path/1, delete_db/1, rescue/1, mailbox_size/0, kill_actor/1, queue_length/1, collect_garbage/0,
          esqlite_has_finalize/0, file_exists/1]).
 
 temp_path(Name) ->
@@ -20,12 +20,6 @@ rescue(Fun) ->
 mailbox_size() ->
     {message_queue_len, N} = erlang:process_info(self(), message_queue_len),
     N.
-
-analyze(Sql) ->
-    case glite_ffi:analyze(Sql) of
-        {ok, {Count, Kind}} -> {ok, {Count, atom_to_binary(Kind)}};
-        {error, E} -> {error, E}
-    end.
 
 %% A Direct connection is {direct, Subject, {handle, Pid, Db, Counters, Config}}.
 kill_actor({direct, _Subject, {handle, Pid, _, _, _}}) ->

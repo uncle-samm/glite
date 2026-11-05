@@ -10,6 +10,7 @@ import gleam/dict
 import gleam/int
 import gleam/io
 import gleam/list
+import gleam/time/timestamp
 import glite
 import glite/config
 import glite/decode
@@ -72,7 +73,7 @@ pub fn run(n: Int) -> Nil {
     <> " ms",
   )
   bench_baseline.compare_and_save(
-    "results/go_sqlite_baseline.terms",
+    "results/go_sqlite_baseline.json",
     dict.from_list([#("insert_ms", insert_ms), #("query_ms", query_ms)]),
   )
 }
@@ -96,5 +97,8 @@ fn insert_users(t: Tx, i: Int, n: Int) -> Result(Nil, error.Error) {
   }
 }
 
-@external(erlang, "bench_baseline_ffi", "now_ms")
-fn now_ms() -> Int
+fn now_ms() -> Int {
+  let #(seconds, nanoseconds) =
+    timestamp.system_time() |> timestamp.to_unix_seconds_and_nanoseconds
+  seconds * 1000 + nanoseconds / 1_000_000
+}

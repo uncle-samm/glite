@@ -26,6 +26,14 @@
 
 ### Changed
 
+- Less Erlang. The SQL scanner, the parameter checks, turning cells into
+  values and naming SQLite errors are now Gleam (`glite/internal/sql` and
+  `glite/internal/db`). What is left in Erlang is the esqlite calls
+  (`glite_sqlite_ffi`) and the actor's process plumbing (`glite_ffi`):
+  atomic counters, reply aliases, re-raising a panic with its stacktrace,
+  `persistent_term` and monotonic time, none of which Gleam's libraries
+  offer. The benchmarks no longer use any Erlang: they use argv, envoy,
+  gleam_time and simplifile, and the go-sqlite baseline is JSON.
 - The README says what a timeout can't interrupt inside a transaction body,
   and adds requirements, error handling, `exec_many` and a comparison with
   sqlight.

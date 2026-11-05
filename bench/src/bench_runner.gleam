@@ -1,13 +1,16 @@
 /// Benchmark runner entry point. From the bench folder:
 /// gleam run -m bench_runner -- <integration | sqlight | go-sqlite | all | compare BASELINE CURRENT>
+import argv
 import bench/compare
 import bench/go_sqlite
 import bench/integration_bench
 import bench/runner
 import bench/sqlight_compare
 import gleam/io
+import simplifile
 
 pub fn main() {
+  let assert Ok(Nil) = simplifile.create_directory_all("results")
   let args = get_args()
 
   case args {
@@ -49,8 +52,9 @@ fn run_integration() -> Nil {
   }
 }
 
-@external(erlang, "bench_ffi", "get_args")
-fn get_args() -> List(String)
+fn get_args() -> List(String) {
+  argv.load().arguments
+}
 
 fn run_sqlight() -> Nil {
   io.println("Comparing glite with sqlight...")

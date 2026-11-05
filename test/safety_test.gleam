@@ -125,6 +125,28 @@ pub fn scanner_test() {
   let assert Error(_) = helpers.analyze("SELECT 1; SELECT 2")
   let assert Error(_) = helpers.analyze("BEGIN; DELETE FROM t")
   let assert Error(_) = helpers.analyze(" ; ")
+  let assert Error(_) = helpers.analyze("")
+  // Semicolons inside a trigger body, and CASE ... END, don't end it.
+  let assert Ok(#(0, "other")) =
+    helpers.analyze(
+      "CREATE TRIGGER t AFTER INSERT ON a BEGIN
+         UPDATE b SET n = CASE WHEN n > 0 THEN n + 1 ELSE 1 END;
+         DELETE FROM c;
+       END;",
+    )
+  let assert Ok(#(0, "other")) =
+    helpers.analyze("CREATE TEMP TRIGGER t AFTER INSERT ON a BEGIN SELECT 1; END")
+  let assert Error(_) =
+    helpers.analyze(
+      "CREATE TRIGGER t AFTER INSERT ON a BEGIN SELECT 1; END; SELECT 2",
+    )
+  // ?NNN and names share one numbering: :a after ?5 is parameter 6.
+  let assert Ok(#(6, "other")) = helpers.analyze("SELECT ?5, :a, :a")
+  let assert Ok(#(1, "dml")) = helpers.analyze("REPLACE INTO t VALUES ($x)")
+  let assert Ok(#(0, "other")) = helpers.analyze("SELECT x'00ff', 1.5e+10")
+  // Non-ASCII identifiers and text.
+  let assert Ok(#(1, "other")) =
+    helpers.analyze("SELECT 'é;', ü FROM t WHERE ö = ?")
 }
 
 // =============================================================================

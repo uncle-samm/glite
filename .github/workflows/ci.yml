@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Test on OTP ${{ matrix.otp }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        otp: ["28", "29"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+          gleam-version: "1.19.2"
+          rebar3-version: "3"
+      - run: gleam format --check src test bench/src
+      - run: gleam deps download
+      - run: gleam build --warnings-as-errors
+      - name: Compile the Erlang FFI with warnings as errors
+        run: erlc +warnings_as_errors -o "$RUNNER_TEMP" src/glite_ffi.erl
+      - run: gleam test
+      - run: gleam docs build
+      - name: Benchmarks compile
+        working-directory: bench
+        run: gleam build --warnings-as-errors

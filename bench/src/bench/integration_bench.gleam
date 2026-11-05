@@ -8,13 +8,14 @@ import glite
 import glite/config
 import glite/decode
 import glite/error
+import glite/tx.{type Tx}
 
 const duration = 5000
 
 const warmup = 50
 
 pub fn run() -> List(BenchmarkResult) {
-  let cfg = config.memory()
+  let cfg = config.memory() |> config.max_rows(100_000)
   let assert Ok(conn) = glite.connect(cfg)
 
   // Setup
@@ -33,7 +34,7 @@ pub fn run() -> List(BenchmarkResult) {
 
   // Pre-populate query table with 1000 rows
   let assert Ok(_) =
-    glite.transaction(conn, fn(c) { populate_rows(c, 1, 1000) })
+    glite.transaction(conn, glite.Immediate, fn(t) { populate_rows(t, 1, 1000) })
 
   io.println("Running integration benchmarks...")
 
@@ -47,25 +48,21 @@ pub fn run() -> List(BenchmarkResult) {
     bench_batch_insert_100(conn),
   ]
 
-  glite.disconnect(conn)
+  let assert Ok(Nil) = glite.disconnect(conn)
 
   list.flat_map(results, fn(r) { runner.extract_results(r) })
 }
 
-fn populate_rows(
-  conn: glite.Connection,
-  current: Int,
-  max: Int,
-) -> Result(Nil, error.Error) {
+fn populate_rows(t: Tx, current: Int, max: Int) -> Result(Nil, error.Error) {
   case current > max {
     True -> Ok(Nil)
     False -> {
       let assert Ok(_) =
-        glite.exec(conn, "INSERT INTO bench_query (val, name) VALUES (?, ?)", [
+        tx.exec(t, "INSERT INTO bench_query (val, name) VALUES (?, ?)", [
           glite.int(current),
           glite.text("row_" <> int.to_string(current)),
         ])
-      populate_rows(conn, current + 1, max)
+      populate_rows(t, current + 1, max)
     }
   }
 }
@@ -76,7 +73,8 @@ fn bench_connect_disconnect(cfg: config.Config) -> bench.BenchResults {
     [
       bench.Function("connect+disconnect", fn(c) {
         let assert Ok(conn) = glite.connect(c)
-        glite.disconnect(conn)
+        let assert Ok(Nil) = glite.disconnect(conn)
+        Nil
       }),
     ],
     [bench.Duration(duration), bench.Warmup(warmup)],
@@ -105,7 +103,8 @@ fn bench_query_select_param(conn: glite.Connection) -> bench.BenchResults {
     [bench.Input("select_?", conn)],
     [
       bench.Function("query", fn(c) {
-        let assert Ok(_) = glite.query(c, "SELECT ? AS val", [glite.int(42)])
+        let assert Ok(_) =
+          glite.query_rows(c, "SELECT ? AS val", [glite.int(42)])
         Nil
       }),
     ],
@@ -119,7 +118,7 @@ fn bench_query_1000_rows(conn: glite.Connection) -> bench.BenchResults {
     [
       bench.Function("query", fn(c) {
         let assert Ok(_) =
-          glite.query(c, "SELECT id, val, name FROM bench_query", [])
+          glite.query_rows(c, "SELECT id, val, name FROM bench_query", [])
         Nil
       }),
     ],
@@ -137,9 +136,9 @@ fn bench_query_with_decoder(conn: glite.Connection) -> bench.BenchResults {
   bench.run(
     [bench.Input("100_rows", conn)],
     [
-      bench.Function("query_with", fn(c) {
+      bench.Function("query_decode", fn(c) {
         let assert Ok(_) =
-          glite.query_with(
+          glite.query(
             c,
             "SELECT id, val, name FROM bench_query WHERE id <= 100",
             [],
@@ -158,9 +157,9 @@ fn bench_transaction(conn: glite.Connection) -> bench.BenchResults {
     [
       bench.Function("transaction", fn(c) {
         let assert Ok(_) =
-          glite.transaction(c, fn(tc) {
+          glite.transaction(c, glite.Deferred, fn(t) {
             let assert Ok(_) =
-              glite.query(tc, "SELECT ? AS val", [glite.int(1)])
+              tx.query_rows(t, "SELECT ? AS val", [glite.int(1)])
             Ok(Nil)
           })
         Nil
@@ -176,7 +175,9 @@ fn bench_batch_insert_100(conn: glite.Connection) -> bench.BenchResults {
     [
       bench.Function("batch_insert_tx", fn(c) {
         let assert Ok(_) =
-          glite.transaction(c, fn(tc) { batch_insert_loop(tc, 1, 100) })
+          glite.transaction(c, glite.Immediate, fn(t) {
+            batch_insert_loop(t, 1, 100)
+          })
         Nil
       }),
     ],
@@ -185,7 +186,7 @@ fn bench_batch_insert_100(conn: glite.Connection) -> bench.BenchResults {
 }
 
 fn batch_insert_loop(
-  conn: glite.Connection,
+  t: Tx,
   current: Int,
   max: Int,
 ) -> Result(Nil, error.Error) {
@@ -193,11 +194,11 @@ fn batch_insert_loop(
     True -> Ok(Nil)
     False -> {
       let assert Ok(_) =
-        glite.exec(conn, "INSERT INTO bench_insert (val, name) VALUES (?, ?)", [
+        tx.exec(t, "INSERT INTO bench_insert (val, name) VALUES (?, ?)", [
           glite.int(current),
           glite.text("batch"),
         ])
-      batch_insert_loop(conn, current + 1, max)
+      batch_insert_loop(t, current + 1, max)
     }
   }
 }

@@ -23,6 +23,8 @@
 -define(SQLITE_BUSY, 5).
 -define(SQLITE_LOCKED, 6).
 -define(SQLITE_CONSTRAINT, 19).
+-define(INTERRUPT_EVERY_MS, 10).
+-define(INTERRUPT_STUCK_MS, 5000).
 
 -define(IS_IDENT_START(C), ((C >= $a andalso C =< $z) orelse (C >= $A andalso C =< $Z)
                             orelse C =:= $_ orelse C >= 16#80)).
@@ -582,11 +584,14 @@ monotonic_ms() -> erlang:monotonic_time(millisecond).
 
 unique_id() -> erlang:unique_integer([positive, monotonic]).
 
-%% Two shared counters per connection:
+%% Three shared counters per connection:
 %%   1. the id of the request the actor is running: 0 when idle, Id while
-%%      running it, -Id while a caller that gave up on it is interrupting it;
-%%   2. the number of requests sent but not yet taken by the actor.
-new_counters() -> atomics:new(2, [{signed, true}]).
+%%      running it, -Id once a caller has given up on it;
+%%   2. the number of requests sent but not yet taken by the actor;
+%%   3. the id of the request a canceller is interrupting at this moment, or
+%%      0. The actor waits for this to clear before it moves on (see
+%%      end_request), so an interrupt can't hit the next request.
+new_counters() -> atomics:new(3, [{signed, true}]).
 
 %% Count a request in, or refuse it when the queue is full.
 admit(Counters, MaxQueue) ->
@@ -614,23 +619,26 @@ begin_request(Counters, Id, Deadline) ->
             started
     end.
 
-%% Mark the actor idle. If a caller is interrupting this request right now,
-%% wait for it to finish, so its interrupt can't hit the next request.
+%% Mark the actor idle. If a caller gave up on this request, a canceller may
+%% be interrupting it: take the request back, then wait for an interrupt call
+%% that is still in flight, so it can't hit the next request.
 end_request(Counters, Id) ->
     case atomics:compare_exchange(Counters, 1, Id, 0) of
-        ok -> nil;
-        _ -> wait_for_canceller(Counters, -Id, monotonic_ms() + 5000)
+        ok ->
+            nil;
+        _ ->
+            ok = atomics:compare_exchange(Counters, 1, -Id, 0),
+            wait_for_interrupt(Counters, Id, monotonic_ms() + ?INTERRUPT_STUCK_MS)
     end.
 
-wait_for_canceller(Counters, Cancelling, Until) ->
-    case atomics:get(Counters, 1) of
-        Cancelling ->
+wait_for_interrupt(Counters, Id, Until) ->
+    case atomics:get(Counters, 3) of
+        Id ->
             case monotonic_ms() > Until of
-                true ->
-                    erlang:error({glite_cancel_stuck, Cancelling});
+                true -> erlang:error({glite_interrupt_stuck, Id});
                 false ->
-                    timer:sleep(1),
-                    wait_for_canceller(Counters, Cancelling, Until)
+                    erlang:yield(),
+                    wait_for_interrupt(Counters, Id, Until)
             end;
         _ ->
             nil
@@ -647,11 +655,15 @@ reply(Alias, Outcome) ->
 
 %% Wait for the actor's reply.
 %%
-%% On timeout the caller cancels. If the actor is running this request, the
-%% caller interrupts it and waits up to Grace ms for the outcome: a request
-%% that still committed is reported as committed, one that failed is reported
-%% as a timeout. If the actor has not started the request it never will (see
-%% begin_request), so that timeout means nothing was written.
+%% On timeout the caller cancels. If the actor is running this request, a
+%% canceller process interrupts it (see cancel/5) while the caller waits up to
+%% Grace ms for the outcome: a request that still committed is reported as
+%% committed, one that failed is reported as a timeout. If the actor has not
+%% started the request it never will (see begin_request), so that timeout
+%% means nothing was written.
+%%
+%% The caller never calls the interrupt NIF itself, so it can't be held up by
+%% it: the call returns within Timeout + Grace ms whatever happens.
 %%
 %% Wrap shapes glite's own errors: plain gives {error, E}; in_transaction gives
 %% {error, {database, E}}, glite's TransactionError.
@@ -665,19 +677,23 @@ await(Mref, Id, Db, Counters, Timeout, Grace, Wrap) ->
     after Timeout ->
         case atomics:compare_exchange(Counters, 1, Id, -Id) of
             ok ->
-                interrupt(Db),
-                _ = atomics:compare_exchange(Counters, 1, -Id, 0),
-                receive
-                    {glite_reply, Mref, Outcome} ->
+                Until = monotonic_ms() + Grace,
+                Caller = self(),
+                Canceller = spawn(fun() -> cancel(Caller, Db, Counters, Id, Until) end),
+                Result =
+                    receive
+                        {glite_reply, Mref, Outcome} ->
+                            erlang:demonitor(Mref, [flush]),
+                            unwrap(Outcome, true, Timeout, Wrap);
+                        {'DOWN', Mref, process, _, _} ->
+                            wrap_error(connection_closed, Wrap)
+                    after Grace ->
                         erlang:demonitor(Mref, [flush]),
-                        unwrap(Outcome, true, Timeout, Wrap);
-                    {'DOWN', Mref, process, _, _} ->
-                        wrap_error(connection_closed, Wrap)
-                after Grace ->
-                    erlang:demonitor(Mref, [flush]),
-                    flush_reply(Mref),
-                    wrap_error({timeout, Timeout}, Wrap)
-                end;
+                        flush_reply(Mref),
+                        wrap_error({timeout, Timeout}, Wrap)
+                    end,
+                Canceller ! glite_stop,
+                Result;
             _ ->
                 %% Not started yet, or already finished. A finished request
                 %% replied before marking itself done, so its reply is here.
@@ -690,9 +706,63 @@ await(Mref, Id, Db, Counters, Timeout, Grace, Wrap) ->
         end
     end.
 
+%% Interrupt request Id until the actor is done with it, the caller stops
+%% waiting for it (it got the reply, gave up, or died), or Until passes.
+%%
+%% One interrupt is not enough: SQLite only interrupts the statements running
+%% at that moment, so an interrupt that lands between two statements of a
+%% transaction, or just before a statement starts, is lost.
+cancel(Caller, Db, Counters, Id, Until) ->
+    Ref = erlang:monitor(process, Caller),
+    cancel_loop(Ref, Db, Counters, Id, Until),
+    nil.
+
+cancel_loop(Ref, Db, Counters, Id, Until) ->
+    case interrupt_request(Db, Counters, Id) of
+        finished ->
+            done;
+        _ ->
+            Wait = min(?INTERRUPT_EVERY_MS, max(0, Until - monotonic_ms())),
+            receive
+                glite_stop -> done;
+                {'DOWN', Ref, process, _, _} -> done
+            after Wait ->
+                case monotonic_ms() >= Until of
+                    true -> done;
+                    false -> cancel_loop(Ref, Db, Counters, Id, Until)
+                end
+            end
+    end.
+
+%% Interrupt the connection if the actor is still on request Id. Counter 3
+%% marks the call as in flight; the actor clears counter 1 before it reads
+%% counter 3 (see end_request), and this reads counter 1 after it sets counter
+%% 3, so either the actor waits for this interrupt or this sees the request is
+%% finished and doesn't interrupt.
+interrupt_request(Db, Counters, Id) ->
+    case atomics:compare_exchange(Counters, 3, 0, Id) of
+        ok ->
+            Result =
+                case atomics:get(Counters, 1) =:= -Id of
+                    true ->
+                        interrupt(Db),
+                        interrupted;
+                    false ->
+                        finished
+                end,
+            atomics:put(Counters, 3, 0),
+            Result;
+        _ ->
+            %% Another canceller, for an earlier request, holds counter 3 for
+            %% a moment. Try again on the next round.
+            busy
+    end.
+
 flush_reply(Mref) ->
     receive {glite_reply, Mref, _} -> ok after 0 -> ok end.
 
+unwrap(never_ran, _Cancelled, Timeout, Wrap) ->
+    wrap_error({timeout, Timeout}, Wrap);
 unwrap({panicked, Class, Reason, Stacktrace}, _Cancelled, _Timeout, _Wrap) ->
     erlang:raise(Class, Reason, Stacktrace);
 unwrap({done, {error, _}}, true, Timeout, Wrap) ->

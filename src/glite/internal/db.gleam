@@ -12,13 +12,61 @@ import glite/value.{type Value}
 /// An open esqlite connection.
 pub type Db
 
-/// The limits a running job needs.
+/// The limits a running job needs. `deadline` is the caller's deadline in
+/// `monotonic_ms` time; a transaction refuses new statements after it.
 pub type Limits {
-  Limits(max_rows: Int, max_batch: Int)
+  Limits(max_rows: Int, max_batch: Int, deadline: Int, timeout_ms: Int)
 }
 
-pub fn limits(config: Config) -> Limits {
-  Limits(max_rows: config.max_rows, max_batch: config.max_batch)
+pub fn limits(config: Config, deadline: Int) -> Limits {
+  Limits(
+    max_rows: config.max_rows,
+    max_batch: config.max_batch,
+    deadline:,
+    timeout_ms: config.call_timeout_ms,
+  )
+}
+
+@external(erlang, "glite_ffi", "monotonic_ms")
+pub fn monotonic_ms() -> Int
+
+/// Refuse to start a statement once the caller's deadline has passed: the
+/// caller has given up, so the rest of the transaction must not run.
+pub fn before_deadline(
+  limits: Limits,
+  next: fn() -> Result(a, Error),
+) -> Result(a, Error) {
+  case monotonic_ms() >= limits.deadline {
+    True -> Error(error.Timeout(limits.timeout_ms))
+    False -> next()
+  }
+}
+
+/// Roll back the open transaction, if there is one. A caller that timed out
+/// keeps interrupting the request for a moment, and an interrupt that lands
+/// just as ROLLBACK starts aborts it, so an interrupted ROLLBACK is tried
+/// again, at most `rollback_tries` times. Any other failure is a panic: the
+/// connection can't be left inside a transaction.
+pub fn rollback(db: Db) -> Nil {
+  rollback_within(db, rollback_tries)
+}
+
+const rollback_tries = 5
+
+const sqlite_interrupt = 9
+
+fn rollback_within(db: Db, tries: Int) -> Nil {
+  case autocommit(db) {
+    True -> Nil
+    False ->
+      case exec_script(db, "ROLLBACK") {
+        Ok(Nil) -> Nil
+        Error(error.Sqlite(code:, ..))
+          if code == sqlite_interrupt && tries > 1
+        -> rollback_within(db, tries - 1)
+        Error(e) -> panic as { "glite: ROLLBACK failed: " <> error.describe(e) }
+      }
+  }
 }
 
 /// Column names and rows from a query.
@@ -198,7 +246,13 @@ pub fn open(config: Config) -> Result(Db, Error) {
 }
 
 fn configure(db: Db, config: Config) -> Result(Nil, Error) {
-  let limits = Limits(max_rows: 10, max_batch: 1)
+  let limits =
+    Limits(
+      max_rows: 10,
+      max_batch: 1,
+      deadline: monotonic_ms() + config.call_timeout_ms,
+      timeout_ms: config.call_timeout_ms,
+    )
   let busy = int.to_string(config.busy_timeout_ms)
   use _ <- result.try(set(db, limits, "busy_timeout", busy, busy))
   let journal = case config.journal_mode {

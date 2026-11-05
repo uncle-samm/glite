@@ -1,4 +1,5 @@
 import gleam/dynamic.{type Dynamic}
+import gleam/erlang/process
 
 @external(erlang, "glite_test_ffi", "temp_path")
 pub fn temp_path(name: String) -> String
@@ -22,4 +23,18 @@ pub fn with_file(name: String, f: fn(String) -> a) -> a {
   let result = f(path)
   delete_db(path)
   result
+}
+
+/// Check `ready` every few milliseconds until it holds, for at most
+/// `within_ms`. For tests that wait on another process without a message to
+/// wait for.
+pub fn eventually(within_ms: Int, ready: fn() -> Bool) -> Bool {
+  case ready() {
+    True -> True
+    False if within_ms <= 0 -> False
+    False -> {
+      process.sleep(5)
+      eventually(within_ms - 5, ready)
+    }
+  }
 }

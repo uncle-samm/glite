@@ -1,7 +1,7 @@
 //// One test per finding in the 0.1.0 review: errors, timeouts, transaction
 //// isolation, busy handling and limits.
 
-import gleam/erlang/process
+import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/list
 import gleam/otp/static_supervisor
@@ -182,17 +182,14 @@ pub fn batch_limit_test() {
 pub fn queue_limit_test() {
   let assert Ok(conn) = glite.connect(config.memory() |> config.max_queue(1))
   // Keep the actor busy, queue one call behind it, then one too many.
-  process.spawn(fn() {
-    glite.transaction(conn, glite.Deferred, fn(_tx) {
-      process.sleep(300)
-      Ok(Nil)
-    })
-  })
-  process.sleep(50)
-  process.spawn(fn() { glite.exec(conn, "SELECT 1", []) })
-  process.sleep(50)
+  let #(held, release) = hold(conn, glite.Deferred)
+  let queued = process.new_subject()
+  process.spawn(fn() { process.send(queued, glite.exec(conn, "SELECT 1", [])) })
+  let assert True = helpers.eventually(2000, fn() { queue_length(conn) == 1 })
   let assert Error(error.Overloaded(1)) = glite.exec(conn, "SELECT 1", [])
-  process.sleep(400)
+  release()
+  let assert Ok(Ok(Nil)) = process.receive(held, 2000)
+  let assert Ok(Ok(0)) = process.receive(queued, 2000)
   let assert Ok(0) = glite.exec(conn, "SELECT 1", [])
 }
 
@@ -244,18 +241,36 @@ pub fn queued_call_that_timed_out_never_runs_test() {
       |> config.call_timeout_ms(200),
     )
   let assert Ok(Nil) = glite.exec_script(conn, "CREATE TABLE t (x)")
-  // A slow job in pure Gleam can't be interrupted; it holds the actor for
-  // 400 ms while the insert below waits in the queue past its deadline.
-  process.spawn(fn() {
-    glite.transaction(conn, glite.Deferred, fn(_tx) {
-      process.sleep(400)
-      Ok(Nil)
-    })
-  })
-  process.sleep(20)
+  // A slow job in pure Gleam can't be interrupted; it holds the actor while
+  // the insert below waits in the queue past its deadline.
+  let #(held, release) = hold(conn, glite.Deferred)
   let assert Error(error.Timeout(200)) =
     glite.exec(conn, "INSERT INTO t VALUES (1)", [])
-  process.sleep(400)
+  release()
+  let assert Ok(_) = process.receive(held, 3000)
+  let assert Ok(0) =
+    glite.query_one(conn, "SELECT count(*) FROM t", [], int_column())
+}
+
+pub fn statements_after_the_deadline_never_run_test() {
+  let assert Ok(conn) =
+    glite.connect(
+      config.memory()
+      |> config.busy_timeout_ms(50)
+      |> config.call_timeout_ms(200),
+    )
+  let assert Ok(Nil) = glite.exec_script(conn, "CREATE TABLE t (x)")
+  let parent = process.new_subject()
+  // The body outlives the deadline in pure Gleam, then tries to write. The
+  // insert is refused without running, so nothing is left behind.
+  let assert Error(glite.Database(error.Timeout(200))) =
+    glite.transaction(conn, glite.Immediate, fn(t) {
+      process.sleep(300)
+      let inserted = tx.exec(t, "INSERT INTO t VALUES (1)", [])
+      process.send(parent, inserted)
+      inserted
+    })
+  let assert Ok(Error(error.Timeout(200))) = process.receive(parent, 2000)
   let assert Ok(0) =
     glite.query_one(conn, "SELECT count(*) FROM t", [], int_column())
 }
@@ -274,17 +289,12 @@ pub fn busy_database_returns_busy_test() {
       |> config.busy_timeout_ms(50)
       |> config.call_timeout_ms(2000),
     )
-  // Hold the write lock for 500 ms from another connection.
-  process.spawn(fn() {
-    glite.transaction(holder, glite.Immediate, fn(_tx) {
-      process.sleep(500)
-      Ok(Nil)
-    })
-  })
-  process.sleep(50)
+  // Hold the write lock from another connection.
+  let #(held, release) = hold(holder, glite.Immediate)
   let assert Error(error.Busy(_)) =
     glite.exec(waiter, "INSERT INTO t VALUES (1)", [])
-  process.sleep(550)
+  release()
+  let assert Ok(Ok(Nil)) = process.receive(held, 2000)
   let assert Ok(1) = glite.exec(waiter, "INSERT INTO t VALUES (1)", [])
   let assert Ok(Nil) = glite.disconnect(waiter)
   let assert Ok(Nil) = glite.disconnect(holder)
@@ -323,18 +333,20 @@ pub fn transaction_rolls_back_on_error_test() {
 pub fn other_callers_cannot_join_a_transaction_test() {
   let conn = schema()
   let parent = process.new_subject()
+  let started = process.new_subject()
   // A transaction inserts team 1, waits, then rolls back.
   process.spawn(fn() {
     let result =
       glite.transaction(conn, glite.Immediate, fn(t) {
         let assert Ok(1) =
           tx.exec(t, "INSERT INTO teams (id, name) VALUES (1, 'a')", [])
+        process.send(started, Nil)
         process.sleep(200)
         Error("roll back")
       })
     process.send(parent, result)
   })
-  process.sleep(50)
+  let assert Ok(Nil) = process.receive(started, 2000)
   // Meanwhile another process writes. In 0.1.0 this ran inside the open
   // transaction and was rolled back with it.
   let assert Ok(1) =
@@ -491,12 +503,14 @@ pub fn supervised_connection_survives_a_restart_test() {
   let assert Ok(1) = glite.exec(conn, "INSERT INTO t VALUES (1)", [])
   let assert Ok(pid) = process.named(name)
   process.kill(pid)
-  process.sleep(100)
+  // While the supervisor restarts it, calls are ConnectionClosed. Then the
+  // same Connection value reaches the new actor, on the same file.
+  let assert True =
+    helpers.eventually(2000, fn() {
+      glite.query_one(conn, "SELECT count(*) FROM t", [], int_column()) == Ok(1)
+    })
   let assert Ok(new_pid) = process.named(name)
   let assert True = new_pid != pid
-  // Same Connection value, new actor, same file.
-  let assert Ok(1) =
-    glite.query_one(conn, "SELECT count(*) FROM t", [], int_column())
 }
 
 pub fn unknown_name_is_connection_closed_test() {
@@ -507,6 +521,32 @@ pub fn unknown_name_is_connection_closed_test() {
 // =============================================================================
 // Helpers
 // =============================================================================
+
+/// Start a transaction that keeps the connection's actor busy until
+/// `release` is called. Returns once the actor is running it, with a subject
+/// that gets the transaction's result.
+fn hold(
+  conn: glite.Connection,
+  mode: glite.TransactionMode,
+) -> #(Subject(Result(Nil, glite.TransactionError(Nil))), fn() -> Nil) {
+  let started = process.new_subject()
+  let finished = process.new_subject()
+  process.spawn(fn() {
+    let result =
+      glite.transaction(conn, mode, fn(_tx) {
+        let gate = process.new_subject()
+        process.send(started, gate)
+        let _ = process.receive(gate, 5000)
+        Ok(Nil)
+      })
+    process.send(finished, result)
+  })
+  let assert Ok(gate) = process.receive(started, 2000)
+  #(finished, fn() { process.send(gate, Nil) })
+}
+
+@external(erlang, "glite_test_ffi", "queue_length")
+fn queue_length(conn: glite.Connection) -> Int
 
 fn schema() -> glite.Connection {
   let assert Ok(conn) = glite.connect(config.memory())

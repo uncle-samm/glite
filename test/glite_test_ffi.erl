@@ -1,5 +1,5 @@
 -module(glite_test_ffi).
--export([temp_path/1, delete_db/1, rescue/1, mailbox_size/0, analyze/1, kill_actor/1]).
+-export([temp_path/1, delete_db/1, rescue/1, mailbox_size/0, analyze/1, kill_actor/1, queue_length/1]).
 
 temp_path(Name) ->
     Dir = case os:getenv("TMPDIR") of false -> "/tmp"; D -> D end,
@@ -31,3 +31,7 @@ kill_actor({direct, _Subject, {handle, Pid, _, _, _}}) ->
     Ref = erlang:monitor(process, Pid),
     exit(Pid, kill),
     receive {'DOWN', Ref, process, Pid, _} -> nil end.
+
+%% Calls sent to the actor but not yet taken by it.
+queue_length({direct, _Subject, {handle, _, _, Counters, _}}) ->
+    atomics:get(Counters, 2).

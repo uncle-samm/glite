@@ -260,27 +260,15 @@ fn run_transaction(
           case db.exec_script(db, "COMMIT") {
             Ok(Nil) -> Ok(value)
             Error(e) -> {
-              rollback(db)
+              db.rollback(db)
               Error(Database(e))
             }
           }
         Error(e) -> {
-          rollback(db)
+          db.rollback(db)
           Error(RolledBack(e))
         }
       }
-  }
-}
-
-/// Roll back if a transaction is still open. An interrupt or some I/O errors
-/// roll back by themselves.
-fn rollback(db: Db) -> Nil {
-  case db.autocommit(db) {
-    True -> Nil
-    False -> {
-      let assert Ok(Nil) = db.exec_script(db, "ROLLBACK")
-      Nil
-    }
   }
 }
 
@@ -417,7 +405,7 @@ fn call_with(
           let id = unique_id()
           let deadline = monotonic_ms() + timeout
           let token = prepare_call(handle.pid)
-          let limits = db.limits(handle.config)
+          let limits = db.limits(handle.config, deadline)
           process.send(subject, message(id, deadline, token, limits))
           await(
             token,

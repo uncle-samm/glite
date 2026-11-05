@@ -15,7 +15,11 @@ gleam_stdlib 1.x, Gleam 1.19 or newer, and OTP 28 or newer.
   In 0.1.0 a unique violation read `SqliteError(0, "2067")`.
 - A slow call returns `Timeout` and interrupts its statement, instead of
   panicking in the caller while the statement keeps running. A late reply no
-  longer lands in the caller's mailbox.
+  longer lands in the caller's mailbox. A call returns within
+  `call_timeout_ms + interrupt_grace_ms` whatever happens: a separate process
+  keeps interrupting the statement during the grace period, and once the
+  deadline has passed every further statement in a transaction returns
+  `Timeout` without running.
 - A locked database returns `Busy` instead of crashing the connection actor.
 - A cell that isn't valid UTF-8 is returned as `Blob`, never as `Text` holding
   invalid UTF-8.

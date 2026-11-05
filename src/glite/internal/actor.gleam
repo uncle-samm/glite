@@ -19,6 +19,8 @@ pub type Counters
 pub type Outcome {
   Done(value: Dynamic)
   Panicked(class: Dynamic, reason: Dynamic, stacktrace: Dynamic)
+  /// The request's deadline passed before the actor took it, so it never ran.
+  NeverRan
 }
 
 /// A message to a connection actor.
@@ -109,7 +111,9 @@ fn handle_message(
   case message {
     Run(id:, deadline:, reply: token, job:) -> {
       case begin_request(state.counters, id, deadline) {
-        Expired -> Nil
+        // A caller that is still waiting reports a timeout; one that left
+        // already deactivated its alias, so the reply is dropped.
+        Expired -> reply(token, NeverRan)
         Started -> {
           let outcome = protect(fn() { job(state.db) })
           let outcome = settle(state.db, outcome)
@@ -121,7 +125,10 @@ fn handle_message(
     }
     Stop(id:, deadline:, reply: token) -> {
       case begin_request(state.counters, id, deadline) {
-        Expired -> actor.continue(state)
+        Expired -> {
+          reply(token, NeverRan)
+          actor.continue(state)
+        }
         Started -> {
           case state.name {
             Some(name) -> erase_named(name)
@@ -144,9 +151,10 @@ fn settle(db: Db, outcome: Outcome) -> Outcome {
   case db.autocommit(db), outcome {
     True, _ -> outcome
     False, Panicked(..) -> {
-      let assert Ok(Nil) = db.exec_script(db, "ROLLBACK")
+      db.rollback(db)
       outcome
     }
-    False, Done(_) -> panic as "glite: a job left a transaction open"
+    False, Done(_) | False, NeverRan ->
+      panic as "glite: a job left a transaction open"
   }
 }

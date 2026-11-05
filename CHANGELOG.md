@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.3.1 - 2026-11-05
+
+### Fixed
+
+- A call's timeout could fail to fire while a slow statement was running.
+  Finished statements were left for the garbage collector to finalize, and the
+  runtime runs that cleanup later on a normal scheduler, where it waits for the
+  connection's mutex. If a slow statement held the mutex, the whole scheduler
+  stopped until it finished, along with every timer on it, so the call was
+  never interrupted. glite now finalizes each statement as soon as it is done
+  with it.
+
 ## v0.3.0 - 2026-11-05
 
 A safety release, with breaking API changes throughout. glite now needs

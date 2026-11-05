@@ -48,18 +48,18 @@ pub type Config {
     /// How long SQLite waits for another connection's lock before returning
     /// `Busy`. Must be shorter than `call_timeout_ms`.
     busy_timeout_ms: Int,
-    /// How long a caller waits for a call to finish before interrupting it and
-    /// returning `Timeout`.
+    /// How long a call may take, waiting for the connection included. Then
+    /// its SQL is interrupted, and it returns `Timeout`.
     call_timeout_ms: Int,
-    /// After interrupting a call, how long the caller waits for SQLite to stop
-    /// before giving up on it.
-    interrupt_grace_ms: Int,
     /// Most rows one query may return.
     max_rows: Int,
     /// Most parameter sets one `exec_many` call may take.
     max_batch: Int,
     /// Most calls that may wait for the connection at once.
     max_queue: Int,
+    /// Most prepared statements the connection keeps for reuse, by SQL text.
+    /// 0 prepares every statement again each time.
+    statement_cache: Int,
     /// Extra PRAGMAs, applied in order after the settings above.
     pragmas: List(#(String, String)),
   )
@@ -67,7 +67,7 @@ pub type Config {
 
 /// Settings for a database file: WAL, full sync, foreign keys on, a 5 s busy
 /// timeout, a 10 s call timeout, and at most 10,000 rows per query, 10,000
-/// parameter sets per batch and 1,000 waiting calls.
+/// parameter sets per batch, 1,000 waiting calls and 200 cached statements.
 pub fn new(path: String) -> Config {
   Config(
     path:,
@@ -76,10 +76,10 @@ pub fn new(path: String) -> Config {
     foreign_keys: True,
     busy_timeout_ms: 5000,
     call_timeout_ms: 10_000,
-    interrupt_grace_ms: 1000,
     max_rows: 10_000,
     max_batch: 10_000,
     max_queue: 1000,
+    statement_cache: 200,
     pragmas: [],
   )
 }
@@ -109,10 +109,6 @@ pub fn call_timeout_ms(config: Config, ms: Int) -> Config {
   Config(..config, call_timeout_ms: ms)
 }
 
-pub fn interrupt_grace_ms(config: Config, ms: Int) -> Config {
-  Config(..config, interrupt_grace_ms: ms)
-}
-
 pub fn max_rows(config: Config, limit: Int) -> Config {
   Config(..config, max_rows: limit)
 }
@@ -123,6 +119,14 @@ pub fn max_batch(config: Config, limit: Int) -> Config {
 
 pub fn max_queue(config: Config, limit: Int) -> Config {
   Config(..config, max_queue: limit)
+}
+
+/// Keep up to `size` prepared statements for reuse. Preparing a statement
+/// costs about as much as running a small one, so statements that run often
+/// are prepared once. Build SQL with placeholders rather than by pasting
+/// values into it, or every call is a new statement.
+pub fn statement_cache(config: Config, size: Int) -> Config {
+  Config(..config, statement_cache: size)
 }
 
 /// Add a PRAGMA to run when the database opens, after the ones before it.

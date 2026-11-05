@@ -4,7 +4,6 @@
 import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/list
-import gleam/otp/static_supervisor
 import gleam/string
 import glite
 import glite/config
@@ -205,7 +204,7 @@ pub fn batch_limit_test() {
 
 pub fn queue_limit_test() {
   let assert Ok(conn) = glite.connect(config.memory() |> config.max_queue(1))
-  // Keep the actor busy, queue one call behind it, then one too many.
+  // Hold the connection, queue one call behind it, then one too many.
   let #(held, release) = hold(conn, glite.Deferred)
   let queued = process.new_subject()
   process.spawn(fn() { process.send(queued, glite.exec(conn, "SELECT 1", [])) })
@@ -259,7 +258,7 @@ pub fn timed_out_transaction_is_rolled_back_test() {
 
 // A statement left to the garbage collector is finalized by a resource
 // destructor that runs later on a normal scheduler and takes the connection's
-// mutex. In 0.3.0 that could happen while the actor ran a slow statement on
+// mutex. In 0.3.0 that could happen while a slow statement ran on
 // the same connection: the scheduler blocked until the statement ended, its
 // timers stopped, and the timeout never fired.
 pub fn finished_statements_never_block_a_scheduler_test() {
@@ -290,7 +289,7 @@ pub fn queued_call_that_timed_out_never_runs_test() {
       |> config.call_timeout_ms(200),
     )
   let assert Ok(Nil) = glite.exec_script(conn, "CREATE TABLE t (x)")
-  // A slow job in pure Gleam can't be interrupted; it holds the actor while
+  // A slow job in pure Gleam can't be interrupted; it holds the connection while
   // the insert below waits in the queue past its deadline.
   let #(held, release) = hold(conn, glite.Deferred)
   let assert Error(error.Timeout(200)) =
@@ -487,12 +486,49 @@ fn try_db(
 }
 
 // =============================================================================
-// A stopped actor is ConnectionClosed, not a panic
+// Dead processes never strand the connection
 // =============================================================================
 
-pub fn killed_actor_is_connection_closed_test() {
+pub fn connection_closes_when_its_owner_crashes_test() {
   let parent = process.new_subject()
   // Connect from a process that isn't linked to this test.
+  let owner =
+    process.spawn_unlinked(fn() {
+      let assert Ok(conn) = glite.connect(config.memory())
+      process.send(parent, conn)
+      process.sleep(5000)
+    })
+  let assert Ok(conn) = process.receive(parent, 1000)
+  let assert Ok(1) = glite.query_one(conn, "SELECT 1", [], int_column())
+  let assert Ok(rows) = glite.query_rows(conn, "SELECT 1", [])
+  let assert [_] = rows.rows
+  process.kill(owner)
+  let assert True =
+    helpers.eventually(1000, fn() {
+      glite.exec(conn, "SELECT 1", []) == Error(error.ConnectionClosed)
+    })
+  // Closed for good, and disconnecting it again is fine.
+  let assert Error(error.ConnectionClosed) =
+    glite.query_one(conn, "SELECT 1", [], int_column())
+  let assert Ok(Nil) = glite.disconnect(conn)
+}
+
+pub fn connection_outlives_an_owner_that_exits_normally_test() {
+  let parent = process.new_subject()
+  process.spawn_unlinked(fn() {
+    let assert Ok(conn) = glite.connect(config.memory())
+    process.send(parent, conn)
+  })
+  let assert Ok(conn) = process.receive(parent, 1000)
+  process.sleep(50)
+  let assert Ok(1) = glite.query_one(conn, "SELECT 1", [], int_column())
+  let assert Ok(Nil) = glite.disconnect(conn)
+}
+
+pub fn killed_helper_is_connection_closed_test() {
+  let parent = process.new_subject()
+  // The helper is linked to the process that connected, like any process
+  // holding a resource for it, so connect from one that isn't this test.
   process.spawn_unlinked(fn() {
     let assert Ok(conn) = glite.connect(config.memory())
     process.send(parent, conn)
@@ -500,14 +536,172 @@ pub fn killed_actor_is_connection_closed_test() {
   })
   let assert Ok(conn) = process.receive(parent, 1000)
   let assert Ok(1) = glite.query_one(conn, "SELECT 1", [], int_column())
-  let assert Ok(rows) = glite.query_rows(conn, "SELECT 1", [])
-  let assert [_] = rows.rows
-  kill_actor(conn)
+  kill_helper(conn)
   let assert Error(error.ConnectionClosed) = glite.exec(conn, "SELECT 1", [])
 }
 
-@external(erlang, "glite_test_ffi", "kill_actor")
-fn kill_actor(conn: glite.Connection) -> Nil
+pub fn caller_killed_inside_a_transaction_is_rolled_back_test() {
+  let conn = schema()
+  let inside = process.new_subject()
+  let caller =
+    process.spawn_unlinked(fn() {
+      glite.transaction(conn, glite.Immediate, fn(t) {
+        let assert Ok(1) =
+          tx.exec(t, "INSERT INTO teams (id, name) VALUES (1, 'a')", [])
+        process.send(inside, Nil)
+        process.sleep(10_000)
+        Ok(Nil)
+      })
+    })
+  let assert Ok(Nil) = process.receive(inside, 2000)
+  process.kill(caller)
+  // The next caller gets the connection straight away, not after the dead
+  // caller's timeout, and the half-done transaction is gone.
+  let assert Ok(0) =
+    glite.query_one(conn, "SELECT count(*) FROM teams", [], int_column())
+  let assert Ok(1) =
+    glite.exec(conn, "INSERT INTO teams (id, name) VALUES (1, 'b')", [])
+}
+
+pub fn caller_killed_while_queued_never_strands_the_lock_test() {
+  let conn = schema()
+  let #(held, release) = hold(conn, glite.Deferred)
+  let queued =
+    process.spawn_unlinked(fn() {
+      glite.exec(conn, "INSERT INTO teams (id, name) VALUES (1, 'a')", [])
+    })
+  let assert True = helpers.eventually(2000, fn() { queue_length(conn) == 1 })
+  process.kill(queued)
+  release()
+  let assert Ok(Ok(Nil)) = process.receive(held, 2000)
+  let assert Ok(1) =
+    glite.exec(conn, "INSERT INTO teams (id, name) VALUES (2, 'b')", [])
+  let assert 0 = queue_length(conn)
+}
+
+pub fn disconnect_waits_for_the_running_transaction_test() {
+  let conn = schema()
+  let #(held, release) = hold(conn, glite.Immediate)
+  let closed = process.new_subject()
+  process.spawn(fn() { process.send(closed, glite.disconnect(conn)) })
+  let assert Error(Nil) = process.receive(closed, 100)
+  release()
+  let assert Ok(Ok(Nil)) = process.receive(held, 2000)
+  let assert Ok(Ok(Nil)) = process.receive(closed, 2000)
+  let assert Error(error.ConnectionClosed) = glite.exec(conn, "SELECT 1", [])
+}
+
+/// Many processes, each running many short transactions and single calls at
+/// once: every transaction is all or nothing, and the connection is free at
+/// the end.
+pub fn many_callers_at_once_test() {
+  let assert Ok(conn) = glite.connect(config.memory())
+  let assert Ok(Nil) =
+    glite.exec_script(conn, "CREATE TABLE t (worker INT, n INT)")
+  let done = process.new_subject()
+  let workers = 16
+  let rounds = 50
+  ints(1, workers)
+  |> list.each(fn(w) {
+    process.spawn(fn() {
+      ints(1, rounds)
+      |> list.each(fn(n) {
+        let assert Ok(Nil) =
+          glite.transaction(conn, glite.Immediate, fn(t) {
+            use _ <- try_db(
+              tx.exec(t, "INSERT INTO t VALUES (?, ?)", [
+                glite.int(w),
+                glite.int(n),
+              ]),
+            )
+            use _ <- try_db(
+              tx.exec(t, "INSERT INTO t VALUES (?, ?)", [
+                glite.int(w),
+                glite.int(-n),
+              ]),
+            )
+            Ok(Nil)
+          })
+        let assert Ok(_) =
+          glite.query_one(
+            conn,
+            "SELECT count(*) FROM t WHERE worker = ?",
+            [glite.int(w)],
+            int_column(),
+          )
+      })
+      process.send(done, Nil)
+    })
+  })
+  ints(1, workers)
+  |> list.each(fn(_) {
+    let assert Ok(Nil) = process.receive(done, 20_000)
+  })
+  let assert Ok(rows) =
+    glite.query_one(conn, "SELECT count(*) FROM t", [], int_column())
+  let assert True = rows == workers * rounds * 2
+  let assert Ok(0) =
+    glite.query_one(conn, "SELECT sum(n) FROM t", [], int_column())
+  let assert 0 = queue_length(conn)
+}
+
+/// Callers that time out, queue past their deadline, or are killed at any
+/// point, all at once. Whatever happens to each one, every transaction is all
+/// or nothing, and afterwards the connection is free and works.
+pub fn chaos_test() {
+  let assert Ok(conn) =
+    glite.connect(
+      config.memory()
+      |> config.busy_timeout_ms(5)
+      |> config.call_timeout_ms(20),
+    )
+  let assert Ok(Nil) = glite.exec_script(conn, "CREATE TABLE t (n INT)")
+  let workers =
+    ints(1, 24)
+    |> list.map(fn(w) {
+      process.spawn_unlinked(fn() { chaos_worker(conn, w, 0) })
+    })
+  // Kill a worker every few milliseconds, wherever it is.
+  ints(1, 40)
+  |> list.each(fn(i) {
+    process.sleep(5)
+    let assert Ok(victim) = list.drop(workers, i % 24) |> list.first
+    process.kill(victim)
+    Nil
+  })
+  list.each(workers, process.kill)
+  let assert True =
+    helpers.eventually(2000, fn() {
+      glite.query_one(
+        conn,
+        "SELECT coalesce(sum(n), 0) FROM t",
+        [],
+        int_column(),
+      )
+      == Ok(0)
+    })
+  let assert Ok(1) = glite.exec(conn, "INSERT INTO t VALUES (0)", [])
+  let assert 0 = queue_length(conn)
+}
+
+fn chaos_worker(conn: glite.Connection, w: Int, n: Int) -> Nil {
+  let slow = case n % 7 {
+    0 -> slow_sql
+    _ -> "SELECT 1"
+  }
+  let _ =
+    glite.transaction(conn, glite.Immediate, fn(t) {
+      use _ <- try_db(tx.exec(t, "INSERT INTO t VALUES (?)", [glite.int(w)]))
+      use _ <- try_db(tx.query(t, slow, [], int_column()))
+      use _ <- try_db(tx.exec(t, "INSERT INTO t VALUES (?)", [glite.int(-w)]))
+      Ok(Nil)
+    })
+  let _ = glite.query(conn, "SELECT count(*) FROM t", [], int_column())
+  chaos_worker(conn, w, n + 1)
+}
+
+@external(erlang, "glite_test_ffi", "kill_helper")
+fn kill_helper(conn: glite.Connection) -> Nil
 
 // =============================================================================
 // Backup
@@ -565,43 +759,12 @@ pub fn esqlite_still_has_finalize_test() {
 fn esqlite_has_finalize() -> Bool
 
 // =============================================================================
-// Supervision
-// =============================================================================
-
-pub fn supervised_connection_survives_a_restart_test() {
-  use path <- helpers.with_file("supervised")
-  let name = process.new_name("glite_test_db")
-  let assert Ok(_) =
-    static_supervisor.new(static_supervisor.OneForOne)
-    |> static_supervisor.add(glite.supervised(config.new(path), name))
-    |> static_supervisor.start
-  let conn = glite.named(name)
-  let assert Ok(Nil) = glite.exec_script(conn, "CREATE TABLE t (x)")
-  let assert Ok(1) = glite.exec(conn, "INSERT INTO t VALUES (1)", [])
-  let assert Ok(pid) = process.named(name)
-  process.kill(pid)
-  // While the supervisor restarts it, calls are ConnectionClosed. Then the
-  // same Connection value reaches the new actor, on the same file.
-  let assert True =
-    helpers.eventually(2000, fn() {
-      glite.query_one(conn, "SELECT count(*) FROM t", [], int_column()) == Ok(1)
-    })
-  let assert Ok(new_pid) = process.named(name)
-  let assert True = new_pid != pid
-}
-
-pub fn unknown_name_is_connection_closed_test() {
-  let conn = glite.named(process.new_name("glite_test_nobody"))
-  let assert Error(error.ConnectionClosed) = glite.exec(conn, "SELECT 1", [])
-}
-
-// =============================================================================
 // Helpers
 // =============================================================================
 
-/// Start a transaction that keeps the connection's actor busy until
-/// `release` is called. Returns once the actor is running it, with a subject
-/// that gets the transaction's result.
+/// Start a transaction that holds the connection until `release` is called.
+/// Returns once it holds it, with a subject that gets the transaction's
+/// result.
 fn hold(
   conn: glite.Connection,
   mode: glite.TransactionMode,

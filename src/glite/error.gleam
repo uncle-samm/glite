@@ -39,7 +39,7 @@ pub type Error {
   InvalidConfig(message: String)
   /// A backup could not be made or did not pass its integrity check.
   Backup(message: String)
-  /// The connection is closed, or its actor has stopped.
+  /// The connection is closed, or the process that opened it crashed.
   ConnectionClosed
 }
 

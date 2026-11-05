@@ -1,5 +1,5 @@
 -module(glite_test_ffi).
--export([temp_path/1, delete_db/1, rescue/1, mailbox_size/0, kill_actor/1, queue_length/1, collect_garbage/0,
+-export([temp_path/1, delete_db/1, rescue/1, mailbox_size/0, kill_helper/1, queue_length/1, collect_garbage/0,
          esqlite_has_finalize/0, file_exists/1]).
 
 temp_path(Name) ->
@@ -21,15 +21,16 @@ mailbox_size() ->
     {message_queue_len, N} = erlang:process_info(self(), message_queue_len),
     N.
 
-%% A Direct connection is {direct, Subject, {handle, Pid, Db, Counters, Config}}.
-kill_actor({direct, _Subject, {handle, Pid, _, _, _}}) ->
-    Ref = erlang:monitor(process, Pid),
-    exit(Pid, kill),
-    receive {'DOWN', Ref, process, Pid, _} -> nil end.
+%% A Connection is {connection, Lock, Db, Config}, and its Lock is glite_ffi's
+%% {conn, Db, State, Helper, Holders, MaxQueue}.
+kill_helper({connection, {conn, _, _, Helper, _, _}, _, _}) ->
+    Ref = erlang:monitor(process, Helper),
+    exit(Helper, kill),
+    receive {'DOWN', Ref, process, Helper, _} -> nil end.
 
-%% Calls sent to the actor but not yet taken by it.
-queue_length({direct, _Subject, {handle, _, _, Counters, _}}) ->
-    atomics:get(Counters, 2).
+%% Calls waiting for the connection.
+queue_length({connection, {conn, _, State, _, _, _}, _, _}) ->
+    atomics:get(State, 2).
 
 collect_garbage() ->
     true = erlang:garbage_collect(),

@@ -3,15 +3,29 @@
 %% turning rows into values, naming errors) is done in Gleam; this module only
 %% calls esqlite and reshapes what it returns.
 %%
-%% Every function here runs inside the connection actor, so a connection is
-%% only ever used by one process at a time.
+%% Every function here runs while its caller holds the connection's lock (see
+%% glite_ffi), so a connection is only ever used by one process at a time.
+%% The one exception is interrupt/1, which SQLite allows from any thread.
 -module(glite_sqlite_ffi).
 
 -export([
-    open/1, close/1, autocommit/1, interrupt/1,
+    open/2, close/1, autocommit/1, interrupt/1, clear_statements/1, give_away/2,
+    cached/2, prepare/3,
     exec_script/2, execute/4, query/4, execute_many/4,
     backup/2, verify_backup/1
 ]).
+
+%% A connection: the esqlite handle, and its prepared statements by SQL text,
+%% each with what glite/internal/sql found out about it, at most CacheSize of
+%% them. Preparing a statement costs about as much as running a small one,
+%% so each one is kept and reused. The cache is an ETS table because every
+%% process that holds the connection's lock uses it; glite_ffi:start/2 gives
+%% it to the connection's helper, which outlives the callers.
+-record(db, {raw, cache, cache_size}).
+
+%% A prepared statement: cached, and reset after each use, or used once and
+%% finalized.
+-record(stmt, {ref, cached}).
 
 -define(SQLITE_BUSY, 5).
 
@@ -23,10 +37,11 @@
 %% Connection
 %% =============================================================================
 
-open(Path) ->
+open(Path, CacheSize) ->
     case esqlite3:open(unicode:characters_to_list(Path)) of
-        {ok, Db} ->
-            {ok, Db};
+        {ok, Raw} ->
+            Cache = ets:new(glite_statements, [set, public]),
+            {ok, #db{raw = Raw, cache = Cache, cache_size = CacheSize}};
         {error, Code} when is_integer(Code) ->
             {error, {sqlite_failure, Code,
                      <<"could not open database: ", Path/binary>>, -1}};
@@ -34,78 +49,142 @@ open(Path) ->
             {error, {sqlite_failure, 0, iolist_to_binary(io_lib:format("~p", [Reason])), -1}}
     end.
 
-close(Db) ->
-    _ = esqlite3:close(Db),
+%% Finalize every cached statement first: left to the garbage collector, they
+%% would be finalized later, after the connection is gone.
+close(#db{raw = Raw, cache = Cache} = Db) ->
+    clear_statements(Db),
+    _ = esqlite3:close(Raw),
+    %% A connection that failed to open never got a helper: its caller still
+    %% owns the cache. Otherwise the cache goes with the helper.
+    case ets:info(Cache, owner) =:= self() of
+        true -> true = ets:delete(Cache);
+        false -> ok
+    end,
     nil.
 
-autocommit(Db) ->
-    esqlite3:get_autocommit(Db).
+autocommit(#db{raw = Raw}) ->
+    esqlite3:get_autocommit(Raw).
 
-interrupt(Db) ->
-    _ = esqlite3:interrupt(Db),
+interrupt(#db{raw = Raw}) ->
+    _ = esqlite3:interrupt(Raw),
     nil.
+
+%% Finalize and forget every cached statement. A process that died holding
+%% the connection may have left one half way through a query.
+clear_statements(#db{cache = Cache}) ->
+    try ets:tab2list(Cache) of
+        Entries ->
+            lists:foreach(fun({_Sql, Ref, _Analysis}) -> finalize(Ref) end, Entries),
+            true = ets:delete_all_objects(Cache)
+    catch
+        error:badarg -> ok
+    end,
+    nil.
+
+%% Hand the statement cache to the process that will outlive every caller.
+give_away(#db{cache = Cache}, Pid) ->
+    true = ets:give_away(Cache, Pid, glite_statements),
+    nil.
+
+%% =============================================================================
+%% Prepared statements
+%% =============================================================================
+
+%% The cached statement for Sql, with its analysis.
+cached(#db{cache = Cache}, Sql) ->
+    case ets:lookup(Cache, Sql) of
+        [{Sql, Ref, Analysis}] -> {ok, {#stmt{ref = Ref, cached = true}, Analysis}};
+        [] -> {error, nil}
+    end.
+
+%% Prepare Sql, which glite/internal/sql already checked, and cache it with
+%% its Analysis. When the cache is full, one statement is dropped for it.
+prepare(#db{raw = Raw, cache = Cache, cache_size = CacheSize} = Db, Sql, Analysis) ->
+    case esqlite3:prepare(Raw, Sql) of
+        {error, Code} ->
+            {error, failure(Db, Code)};
+        {ok, {esqlite3_stmt, Ref}} when CacheSize =:= 0 ->
+            {ok, #stmt{ref = Ref, cached = false}};
+        {ok, {esqlite3_stmt, Ref}} ->
+            case ets:info(Cache, size) >= CacheSize of
+                true -> evict_one(Cache);
+                false -> ok
+            end,
+            true = ets:insert(Cache, {Sql, Ref, Analysis}),
+            {ok, #stmt{ref = Ref, cached = true}}
+    end.
+
+evict_one(Cache) ->
+    Sql = ets:first(Cache),
+    [{Sql, Ref, _}] = ets:take(Cache, Sql),
+    finalize(Ref).
+
+%% Done with a statement: reset a cached one, so it holds no locks and can
+%% run again, and finalize one that isn't. Resetting a statement whose last
+%% step failed reports that failure again, which was already returned.
+done(#stmt{ref = Ref, cached = true}) ->
+    _ = esqlite3:reset({esqlite3_stmt, Ref}),
+    ok;
+done(#stmt{ref = Ref, cached = false}) ->
+    finalize(Ref).
 
 %% =============================================================================
 %% Statements
 %% =============================================================================
 
 %% Run a script of zero or more statements, without parameters or results.
-exec_script(Db, Sql) ->
-    case esqlite3:exec(Db, Sql) of
+exec_script(#db{raw = Raw} = Db, Sql) ->
+    case esqlite3:exec(Raw, Sql) of
         ok -> {ok, nil};
         {error, Code} -> {error, failure(Db, Code)}
     end.
 
 %% Run one statement and return the number of rows it changed. Kind is
 %% glite/internal/sql's Kind: dml, with or other.
-execute(Db, Sql, Params, Kind) ->
-    case esqlite3:prepare(Db, Sql) of
-        {error, Code} ->
-            {error, failure(Db, Code)};
-        {ok, Stmt} ->
-            Before = total_changes_before(Db, Kind),
-            try
-                case bind_and_step(Db, Stmt, Params) of
-                    ok -> {ok, changes(Db, Kind, Before)};
-                    {error, _} = Error -> Error
-                end
-            after
-                release(Stmt)
-            end
+execute(Db, #stmt{ref = Ref} = Stmt, Params, Kind) ->
+    Before = total_changes_before(Db, Kind),
+    try
+        case bind_and_step(Db, {esqlite3_stmt, Ref}, Params) of
+            ok -> {ok, changes(Db, Kind, Before)};
+            {error, _} = Error -> Error
+        end
+    after
+        done(Stmt)
     end.
 
 %% Run one statement and return its column names, declared column types and
 %% raw rows, failing when it produces more than MaxRows rows.
-query(Db, Sql, Params, MaxRows) ->
-    case esqlite3:prepare(Db, Sql) of
-        {error, Code} ->
-            {error, failure(Db, Code)};
-        {ok, Stmt} ->
-            try
-                case esqlite3:bind(Stmt, args(Params)) of
-                    ok ->
+query(Db, #stmt{ref = Ref} = Stmt0, Params, MaxRows) ->
+    Stmt = {esqlite3_stmt, Ref},
+    try
+        case esqlite3:bind(Stmt, args(Params)) of
+            ok ->
+                case fetch(Db, Stmt, MaxRows, 0, []) of
+                    {ok, Rows} ->
+                        %% Read after stepping: a cached statement is
+                        %% prepared again on its first step after a schema
+                        %% change, and its columns may change with it.
                         Columns = [unicode:characters_to_binary(N) || N <- esqlite3:column_names(Stmt)],
                         Types = [decltype(T) || T <- esqlite3:column_decltypes(Stmt)],
-                        case fetch(Db, Stmt, MaxRows, 0, []) of
-                            {ok, Rows} -> {ok, {Columns, Types, Rows}};
-                            {error, _} = Error -> Error
-                        end;
-                    {error, Code} ->
-                        {error, failure(Db, Code)}
-                end
-            after
-                release(Stmt)
-            end
+                        {ok, {Columns, Types, Rows}};
+                    {error, _} = Error ->
+                        Error
+                end;
+            {error, Code} ->
+                {error, failure(Db, Code)}
+        end
+    after
+        done(Stmt0)
     end.
 
 %% Run one statement once per parameter list, all or nothing: the batch runs
 %% inside a savepoint that is rolled back if any run fails.
-execute_many(Db, Sql, ParamsList, Kind) ->
+execute_many(Db, Stmt, ParamsList, Kind) ->
     case exec_script(Db, <<"SAVEPOINT glite_batch">>) of
         {error, _} = Error ->
             Error;
         {ok, nil} ->
-            case run_batch(Db, Sql, Kind, ParamsList) of
+            case run_batch(Db, Stmt, Kind, ParamsList) of
                 {ok, _} = Ok ->
                     case exec_script(Db, <<"RELEASE glite_batch">>) of
                         {ok, nil} -> Ok;
@@ -115,22 +194,17 @@ execute_many(Db, Sql, ParamsList, Kind) ->
                     %% Interrupts and some I/O errors roll back the whole
                     %% transaction, taking the savepoint with it, so these
                     %% two may fail; the batch is undone either way.
-                    _ = esqlite3:exec(Db, <<"ROLLBACK TO glite_batch">>),
-                    _ = esqlite3:exec(Db, <<"RELEASE glite_batch">>),
+                    _ = exec_script(Db, <<"ROLLBACK TO glite_batch">>),
+                    _ = exec_script(Db, <<"RELEASE glite_batch">>),
                     Error
             end
     end.
 
-run_batch(Db, Sql, Kind, ParamsList) ->
-    case esqlite3:prepare(Db, Sql) of
-        {error, Code} ->
-            {error, failure(Db, Code)};
-        {ok, Stmt} ->
-            try
-                run_batch_loop(Db, Stmt, Kind, ParamsList, 0)
-            after
-                release(Stmt)
-            end
+run_batch(Db, #stmt{ref = Ref} = Stmt, Kind, ParamsList) ->
+    try
+        run_batch_loop(Db, {esqlite3_stmt, Ref}, Kind, ParamsList, 0)
+    after
+        done(Stmt)
     end.
 
 run_batch_loop(_Db, _Stmt, _Kind, [], Total) ->
@@ -151,11 +225,11 @@ run_batch_loop(Db, Stmt, Kind, [Params | Rest], Total) ->
 %% Finalize a statement as soon as glite is done with it. Left to the garbage
 %% collector, esqlite finalizes it in a resource destructor that the runtime
 %% runs later, on a normal scheduler, and that takes the connection's mutex.
-%% If the actor is running a long statement on the same connection by then,
+%% If a caller is running a long statement on the same connection by then,
 %% that scheduler blocks until the statement ends, and its timers with it, so
 %% a call's timeout never fires. esqlite3 doesn't export a finalize function;
 %% this is the NIF its own q/2 uses to finalize its statements eagerly.
-release({esqlite3_stmt, Ref}) ->
+finalize(Ref) ->
     ok = esqlite3_nif:finalize_query_statement(Ref).
 
 bind_and_step(Db, Stmt, Params) ->
@@ -205,19 +279,18 @@ decltype(Type) when is_binary(Type) -> Type.
 total_changes_before(Db, with) -> total_changes(Db);
 total_changes_before(_Db, _Kind) -> 0.
 
-changes(Db, dml, _Before) -> esqlite3:changes(Db);
+changes(#db{raw = Raw}, dml, _Before) -> esqlite3:changes(Raw);
 changes(Db, with, Before) -> total_changes(Db) - Before;
 changes(_Db, other, _Before) -> 0.
 
-total_changes(Db) ->
-    [[N]] = esqlite3:q(Db, <<"SELECT total_changes()">>),
+total_changes(#db{raw = Raw}) ->
+    [[N]] = esqlite3:q(Raw, <<"SELECT total_changes()">>),
     N.
 
 %% The connection's error_info carries the message for the statement that
-%% just failed, because every statement on a connection runs in the
-%% connection's actor, one at a time.
-failure(Db, Code) when is_integer(Code) ->
-    #{errmsg := Message, error_offset := Offset} = esqlite3:error_info(Db),
+%% just failed, because only the lock's holder runs statements on it.
+failure(#db{raw = Raw}, Code) when is_integer(Code) ->
+    #{errmsg := Message, error_offset := Offset} = esqlite3:error_info(Raw),
     {sqlite_failure, Code, Message, Offset};
 failure(_Db, Reason) ->
     {sqlite_failure, 0, iolist_to_binary(io_lib:format("~p", [Reason])), -1}.
@@ -227,7 +300,7 @@ failure(_Db, Reason) ->
 %% =============================================================================
 
 %% Write a consistent copy of the database to Path with VACUUM INTO. This is
-%% the only part of a backup that runs in the connection actor: checking the
+%% the only part of a backup that holds the connection: checking the
 %% copy uses its own handle, which a timed-out call can't interrupt, so
 %% verify_backup/1 runs in the caller instead. If VACUUM INTO fails or is
 %% interrupted, the partial file it may leave is deleted.
@@ -236,13 +309,20 @@ backup(Db, Path) ->
         true ->
             {error, {exists, Path}};
         false ->
-            case execute(Db, <<"VACUUM INTO ?">>, [{text, Path}], other) of
+            case once(Db, <<"VACUUM INTO ?">>, [{text, Path}]) of
                 {ok, _} ->
                     {ok, nil};
                 {error, Failure} ->
                     _ = file:delete(Path),
                     {error, {failed, Failure}}
             end
+    end.
+
+%% Run a statement once, without caching it.
+once(#db{raw = Raw} = Db, Sql, Params) ->
+    case esqlite3:prepare(Raw, Sql) of
+        {error, Code} -> {error, failure(Db, Code)};
+        {ok, {esqlite3_stmt, Ref}} -> execute(Db, #stmt{ref = Ref, cached = false}, Params, other)
     end.
 
 %% Check a copy written by backup/2 with PRAGMA integrity_check, fsync it, and

@@ -23,7 +23,9 @@ fn print_comparison(
   io.println("")
   case prev {
     Error(_) -> {
-      io.println("  [baseline] No previous baseline found. Saving current as baseline.")
+      io.println(
+        "  [baseline] No previous baseline found. Saving current as baseline.",
+      )
     }
     Ok(baseline) -> {
       io.println("  [baseline] Comparison vs previous run:")
@@ -38,8 +40,7 @@ fn print_comparison(
             let delta = cur_val - prev_val
             let pct = case prev_val {
               0 -> 0.0
-              _ ->
-                int.to_float(delta * 100) /. int.to_float(prev_val)
+              _ -> int.to_float(delta * 100) /. int.to_float(prev_val)
             }
             let sign = case delta >= 0 {
               True -> "+"
@@ -82,11 +83,8 @@ fn float_to_string_1dp(f: Float) -> String {
   sign <> int.to_string(whole) <> "." <> int.to_string(frac)
 }
 
-@external(erlang, "go_sqlite_bench_ffi", "load_baseline")
+@external(erlang, "bench_baseline_ffi", "load_baseline")
 fn load_baseline(path: String) -> Result(BenchResults, String)
 
-@external(erlang, "go_sqlite_bench_ffi", "save_baseline")
-fn save_baseline(
-  path: String,
-  results: BenchResults,
-) -> Result(Nil, String)
+@external(erlang, "bench_baseline_ffi", "save_baseline")
+fn save_baseline(path: String, results: BenchResults) -> Result(Nil, String)

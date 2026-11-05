@@ -1,4 +1,4 @@
--module(go_sqlite_bench_ffi).
+-module(bench_baseline_ffi).
 -export([now_ms/0, load_baseline/1, save_baseline/2, git_short_rev/0]).
 
 now_ms() ->

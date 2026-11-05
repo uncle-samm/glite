@@ -1,4 +1,4 @@
-.PHONY: build test push tag publish release bench bench-pure bench-integration bench-compare format
+.PHONY: build test format check docs release bench bench-integration bench-go-sqlite bench-compare
 
 build:
 	gleam build
@@ -7,30 +7,34 @@ test:
 	gleam test
 
 format:
-	gleam format
+	gleam format src test bench/src
 
-push:
-	sh scripts/push.sh
+# What CI runs.
+check:
+	gleam format --check src test bench/src
+	gleam build --warnings-as-errors
+	gleam test
+	cd bench && gleam build --warnings-as-errors
 
-tag:
-	sh scripts/tag.sh
+docs:
+	gleam docs build
 
-publish:
-	/usr/bin/expect scripts/publish.sh
+# Tag the version in gleam.toml and push the tag; the Release workflow tests
+# it and publishes it to Hex.
+release:
+	sh scripts/release.sh
 
-release: push tag publish
-
-bench: bench-pure bench-integration
-
-bench-pure:
-	gleam build && erl -pa build/dev/erlang/*/ebin -noshell -run bench_runner main -- pure
+bench: bench-integration bench-go-sqlite
 
 bench-integration:
-	gleam build && erl -pa build/dev/erlang/*/ebin -noshell -run bench_runner main -- integration
+	cd bench && gleam run -m bench_runner -- integration
+
+bench-go-sqlite:
+	cd bench && gleam run -m bench_runner -- go-sqlite
 
 bench-compare:
 	@if [ -z "$(BASELINE)" ] || [ -z "$(CURRENT)" ]; then \
-		echo "Usage: make bench-compare BASELINE=bench/results/pure.json CURRENT=bench/results/pure.json"; \
+		echo "Usage: make bench-compare BASELINE=bench/results/a.json CURRENT=bench/results/b.json"; \
 		exit 1; \
 	fi
-	gleam build && erl -pa build/dev/erlang/*/ebin -noshell -run bench_runner main -- compare $(BASELINE) $(CURRENT)
+	cd bench && gleam run -m bench_runner -- compare ../$(BASELINE) ../$(CURRENT)

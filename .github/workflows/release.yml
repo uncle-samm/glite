@@ -1,0 +1,44 @@
+name: Release
+
+# Pushing a tag such as v0.3.0 tests the code and publishes that version to
+# Hex. The tag must match the version in gleam.toml. Needs the HEXPM_API_KEY
+# repository secret.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "29"
+          gleam-version: "1.19.2"
+          rebar3-version: "3"
+      - name: Check the tag matches gleam.toml
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' gleam.toml)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match gleam.toml version $version." >&2
+            exit 1
+          fi
+      - name: Check the Hex key is set
+        env:
+          HEXPM_API_KEY: ${{ secrets.HEXPM_API_KEY }}
+        run: |
+          if [ -z "$HEXPM_API_KEY" ]; then
+            echo "Add a HEXPM_API_KEY secret in Settings > Secrets and variables > Actions." >&2
+            exit 1
+          fi
+      - run: gleam format --check src test
+      - run: gleam build --warnings-as-errors
+      - run: gleam test
+      - name: Publish to Hex
+        env:
+          HEXPM_API_KEY: ${{ secrets.HEXPM_API_KEY }}
+        # Gleam asks 0.x packages to confirm they don't follow semantic
+        # versioning; the answer is piped in.
+        run: printf 'I am not using semantic versioning\n' | gleam publish --yes

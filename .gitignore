@@ -6,5 +6,9 @@ erl_crash.dump
 /tmp/
 *.sqlite
 *.db
-bench/results/*.json
+*.db-wal
+*.db-shm
+bench/build/
+bench/manifest.toml
+bench/results/
 reference/

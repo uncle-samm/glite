@@ -1,13 +1,25 @@
-/// SQLite value types. SQLite has 5 storage classes.
+//// SQLite values.
+
+/// A value SQLite stores. SQLite has five storage classes.
 pub type Value {
-  /// NULL value
   Null
-  /// 64-bit signed integer
+  /// A 64-bit signed integer.
   Integer(Int)
-  /// 64-bit IEEE floating point
+  /// A 64-bit float.
   Real(Float)
-  /// UTF-8 text string
+  /// UTF-8 text.
   Text(String)
-  /// Binary data
+  /// Binary data.
   Blob(BitArray)
+}
+
+/// The storage class's name, for messages.
+pub fn type_name(value: Value) -> String {
+  case value {
+    Null -> "Null"
+    Integer(_) -> "Integer"
+    Real(_) -> "Real"
+    Text(_) -> "Text"
+    Blob(_) -> "Blob"
+  }
 }

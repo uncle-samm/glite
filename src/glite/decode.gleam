@@ -1,38 +1,50 @@
-/// Row decoder combinators for extracting typed values from query results.
-///
-/// ## Usage
-///
-/// ```gleam
-/// import glite/decode
-///
-/// let decoder = {
-///   use id <- decode.element(0, decode.int)
-///   use name <- decode.element(1, decode.text)
-///   use email <- decode.element(2, decode.optional(decode.text))
-///   decode.success(User(id:, name:, email:))
-/// }
-/// ```
+//// Decoders that turn a result row into a typed value.
+////
+//// ```gleam
+//// import glite/decode
+////
+//// let user = {
+////   use id <- decode.element(0, decode.int)
+////   use name <- decode.element(1, decode.text)
+////   use email <- decode.element(2, decode.optional(decode.text))
+////   decode.success(User(id:, name:, email:))
+//// }
+//// ```
+
 import gleam/int
 import gleam/option.{type Option, None, Some}
 import glite/error.{type Error}
 import glite/value.{type Value}
 
-/// A decoder that extracts a typed value from a row (list of columns).
+/// Decodes one row, a list of column values.
 pub opaque type RowDecoder(a) {
-  RowDecoder(run: fn(List(Value)) -> Result(a, Error))
+  RowDecoder(run: fn(List(Value)) -> Result(a, Failure))
 }
 
-/// A decoder that extracts a typed value from a single cell.
+/// Decodes one column value. The error is a short description.
 pub type ValueDecoder(a) =
-  fn(Value) -> Result(a, Error)
+  fn(Value) -> Result(a, String)
 
-/// Run a decoder on a row.
-pub fn run(decoder: RowDecoder(a), row: List(Value)) -> Result(a, Error) {
-  decoder.run(row)
+type Failure {
+  Failure(message: String, column: Int)
 }
 
-/// Decode the element at a given column index using a value decoder.
-/// Designed for use with Gleam's `use` syntax.
+/// Run a decoder on one row. `row` is the row's position in its result, used
+/// in the error.
+pub fn run(
+  decoder: RowDecoder(a),
+  row: List(Value),
+  at row_index: Int,
+) -> Result(a, Error) {
+  case decoder.run(row) {
+    Ok(value) -> Ok(value)
+    Error(Failure(message:, column:)) ->
+      Error(error.Decode(message:, row: row_index, column:))
+  }
+}
+
+/// Decode the column at `index`, counting from 0, then carry on with `next`.
+/// Made for `use`.
 pub fn element(
   index: Int,
   decoder: ValueDecoder(a),
@@ -40,90 +52,73 @@ pub fn element(
 ) -> RowDecoder(b) {
   RowDecoder(fn(row) {
     case list_at(row, index) {
+      Error(Nil) ->
+        Error(Failure("there is no column " <> int.to_string(index), index))
       Ok(cell) ->
         case decoder(cell) {
-          Ok(val) -> run(next(val), row)
-          Error(e) -> Error(e)
+          Ok(value) -> next(value).run(row)
+          Error(message) -> Error(Failure(message, index))
         }
-      Error(_) ->
-        Error(error.DecodeError(
-          "Column index " <> int.to_string(index) <> " out of bounds",
-        ))
     }
   })
 }
 
-/// Finalize a decoder chain with a value.
+/// Finish a decoder with a value.
 pub fn success(value: a) -> RowDecoder(a) {
   RowDecoder(fn(_row) { Ok(value) })
 }
 
-// =============================================================================
-// Value decoders
-// =============================================================================
-
-/// Decode an integer value.
-pub fn int(val: Value) -> Result(Int, Error) {
-  case val {
+/// An integer.
+pub fn int(value: Value) -> Result(Int, String) {
+  case value {
     value.Integer(n) -> Ok(n)
-    other ->
-      Error(error.DecodeError(
-        "Expected Integer, got " <> value_type_name(other),
-      ))
+    other -> Error(expected("Integer", other))
   }
 }
 
-/// Decode a float value.
-pub fn float(val: Value) -> Result(Float, Error) {
-  case val {
+/// A float.
+pub fn float(value: Value) -> Result(Float, String) {
+  case value {
     value.Real(f) -> Ok(f)
-    other ->
-      Error(error.DecodeError("Expected Real, got " <> value_type_name(other)))
+    other -> Error(expected("Real", other))
   }
 }
 
-/// Decode a text/string value.
-pub fn text(val: Value) -> Result(String, Error) {
-  case val {
+/// Text.
+pub fn text(value: Value) -> Result(String, String) {
+  case value {
     value.Text(s) -> Ok(s)
-    other ->
-      Error(error.DecodeError("Expected Text, got " <> value_type_name(other)))
+    other -> Error(expected("Text", other))
   }
 }
 
-/// Decode a blob (binary data) value.
-pub fn blob(val: Value) -> Result(BitArray, Error) {
-  case val {
+/// Binary data. Text is accepted too, as its UTF-8 bytes, because SQLite
+/// doesn't always say which of the two a value is.
+pub fn blob(value: Value) -> Result(BitArray, String) {
+  case value {
     value.Blob(b) -> Ok(b)
-    other ->
-      Error(error.DecodeError("Expected Blob, got " <> value_type_name(other)))
+    value.Text(s) -> Ok(<<s:utf8>>)
+    other -> Error(expected("Blob", other))
   }
 }
 
-/// Decode a boolean value (SQLite stores as Integer 0/1).
-pub fn bool(val: Value) -> Result(Bool, Error) {
-  case val {
+/// A boolean stored as the integer 0 or 1.
+pub fn bool(value: Value) -> Result(Bool, String) {
+  case value {
     value.Integer(0) -> Ok(False)
     value.Integer(1) -> Ok(True)
-    value.Integer(n) ->
-      Error(error.DecodeError(
-        "Expected Boolean (0 or 1), got Integer " <> int.to_string(n),
-      ))
-    other ->
-      Error(error.DecodeError(
-        "Expected Boolean (Integer 0/1), got " <> value_type_name(other),
-      ))
+    value.Integer(n) -> Error("expected 0 or 1, got " <> int.to_string(n))
+    other -> Error(expected("Integer 0 or 1", other))
   }
 }
 
-/// Make any value decoder nullable (NULL-safe).
-/// Returns `Ok(None)` for NULL, `Ok(Some(val))` for non-NULL.
+/// NULL becomes `None`; anything else goes through `decoder`.
 pub fn optional(decoder: ValueDecoder(a)) -> ValueDecoder(Option(a)) {
-  fn(val) {
-    case val {
+  fn(value) {
+    case value {
       value.Null -> Ok(None)
       _ ->
-        case decoder(val) {
+        case decoder(value) {
           Ok(v) -> Ok(Some(v))
           Error(e) -> Error(e)
         }
@@ -131,29 +126,19 @@ pub fn optional(decoder: ValueDecoder(a)) -> ValueDecoder(Option(a)) {
   }
 }
 
-/// Decode any value as-is (always succeeds, returns the raw Value).
-pub fn dynamic(val: Value) -> Result(Value, Error) {
-  Ok(val)
+/// The value as it is.
+pub fn raw(value: Value) -> Result(Value, String) {
+  Ok(value)
 }
 
-// =============================================================================
-// Helpers
-// =============================================================================
-
-fn list_at(l: List(a), index: Int) -> Result(a, Nil) {
-  case l, index {
+fn list_at(list: List(a), index: Int) -> Result(a, Nil) {
+  case list, index {
     [x, ..], 0 -> Ok(x)
     [_, ..rest], n if n > 0 -> list_at(rest, n - 1)
     _, _ -> Error(Nil)
   }
 }
 
-fn value_type_name(val: Value) -> String {
-  case val {
-    value.Null -> "Null"
-    value.Integer(_) -> "Integer"
-    value.Real(_) -> "Real"
-    value.Text(_) -> "Text"
-    value.Blob(_) -> "Blob"
-  }
+fn expected(wanted: String, got: Value) -> String {
+  "expected " <> wanted <> ", got " <> value.type_name(got)
 }

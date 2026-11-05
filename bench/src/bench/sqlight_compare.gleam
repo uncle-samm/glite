@@ -1,8 +1,8 @@
 //// The same operations through glite and through sqlight, the other SQLite
-//// package for Gleam on Erlang, on in-memory databases. sqlight calls SQLite
-//// directly from the calling process; glite sends every call to the
-//// connection's actor. The difference between the two is the cost of that
-//// actor, and the last benchmark shows what it costs under concurrency.
+//// package for Gleam on Erlang, on in-memory databases. Both call SQLite from
+//// the calling process; glite also takes the connection's lock, checks the
+//// SQL and reuses prepared statements. The last benchmark shows how the two
+//// share one connection between processes.
 
 import bench/runner.{type BenchmarkResult}
 import gleam/dynamic/decode as dyn

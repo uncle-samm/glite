@@ -5,6 +5,8 @@
 
 A SQLite driver for Gleam on the Erlang VM, built on [esqlite](https://hex.pm/packages/esqlite), which bundles SQLite 3.50.4.
 
+> glite is a personal project: I build it for my own use and share it in case it helps you too. There are no promises of support, fixes or a roadmap. Issues and pull requests are welcome, and so is forking it to make it your own.
+
 ```sh
 gleam add glite
 ```
@@ -47,11 +49,12 @@ pub fn main() {
 
 ## How it works
 
-A connection is one actor that owns the SQLite handle and runs every call on it, one at a time. Share a `Connection` between as many processes as you like: their calls queue up in the actor.
+Every call runs in the calling process, holding the connection's lock while it uses SQLite, so callers use a connection one at a time. Share a `Connection` between as many processes as you like. Taking a free connection is one atomic compare-and-swap, with no message to another process; when it is busy, callers queue in order and each is woken when its turn comes. Each connection keeps its prepared statements for reuse.
 
-- **Transactions are isolated.** `glite.transaction` sends the whole transaction to the actor as one job, so no other caller's statements can run in the middle of it. The body gets a `Tx` to run statements with, and returns `Ok` to commit or `Error` to roll back. A panic in the body is rolled back and re-raised in the calling process.
+- **Transactions are isolated.** `glite.transaction` holds the connection from `BEGIN` to `COMMIT`, so no other caller's statements can run in the middle of it. The body gets a `Tx` to run statements with, and returns `Ok` to commit or `Error` to roll back. A panic in the body is rolled back and re-raised in the calling process.
 - **Calls are bounded.** A call that takes longer than `call_timeout_ms` returns `Timeout`, and its running SQL statement is interrupted, so the connection is free again straight away. A timed-out call never commits: if it hadn't started yet, it never will.
-- **Nothing panics on its own.** A busy database is `Busy`, a stopped actor is `ConnectionClosed`, and a full queue is `Overloaded`.
+- **Dead callers don't strand the connection.** If a process dies while it holds the connection, even in the middle of a transaction or a long query, the connection interrupts what it left running, rolls it back, and moves on to the next caller straight away.
+- **Nothing panics on its own.** A busy database is `Busy`, a closed connection is `ConnectionClosed`, and a full queue is `Overloaded`.
 - **Errors say what happened.** Constraint failures say which kind (`Unique`, `PrimaryKey`, `ForeignKey`, `Check`, `NotNull`), and other SQLite errors carry their result codes, SQLite's message, and the offset in the SQL they point at.
 
 ```gleam
@@ -67,7 +70,7 @@ glite.transaction(conn, glite.Immediate, fn(t) {
 
 Use `Immediate` for any transaction that writes. Calling the `Connection` from inside its own transaction body panics with a clear message; use the `Tx`.
 
-The body runs inside the connection's actor, so keep it to SQL on the `Tx` and quick Gleam code. A timeout can interrupt SQL, but not anything else: a body that waits for a message, loops, or calls another slow service keeps the connection busy until it finishes, and every other caller waits behind it. Don't call a second glite connection from a transaction body either: if that connection's transaction calls back into the first, both wait for each other until they time out.
+The body runs in the calling process while it holds the connection, so keep it to SQL on the `Tx` and quick Gleam code. A timeout can interrupt SQL, but not anything else: a body that waits for a message, loops, or calls another slow service keeps the connection busy, and its caller waiting, until it finishes, and every other caller waits behind it. Once the deadline has passed, every statement on the `Tx` returns `Timeout` without running. Don't call a second glite connection from a transaction body either: if that connection's transaction calls back into the first, both wait for each other until they time out.
 
 ## Handling errors
 
@@ -108,27 +111,16 @@ Every limit is in the config, and reaching one is an error, never a silent trunc
 | `busy_timeout_ms` | 5,000 | `Busy`; must be shorter than the call timeout |
 | `max_rows` | 10,000 | `RowLimitExceeded`; no rows are returned |
 | `max_batch` | 10,000 | `BatchLimitExceeded` for `exec_many` |
-| `max_queue` | 1,000 | `Overloaded`; the call isn't sent |
-| `interrupt_grace_ms` | 1,000 | How long a timed-out caller waits for SQLite to stop |
+| `max_queue` | 1,000 | `Overloaded`; the call doesn't wait |
+| `statement_cache` | 200 | A cached statement is finalized to make room for a new one |
 
 `config.new(path)` uses WAL, `synchronous=FULL` (a committed transaction survives a power cut) and foreign keys on. `config.memory()` is the same for a private in-memory database.
 
-## Supervision
+## Lifetime
 
-```gleam
-import gleam/erlang/process
-import gleam/otp/static_supervisor
+A connection is open until `glite.disconnect`, or until the process that called `glite.connect` crashes; a process that exits normally leaves it open. Each connection has one small helper process, linked to the process that connected, that queues waiting callers, interrupts calls past their deadline and cleans up after callers that die. It never runs a query.
 
-let db = process.new_name("db")
-let assert Ok(_) =
-  static_supervisor.new(static_supervisor.OneForOne)
-  |> static_supervisor.add(glite.supervised(config.new("app.db"), db))
-  |> static_supervisor.start
-
-let conn = glite.named(db)
-```
-
-If the connection's actor crashes, the supervisor restarts it, which opens the database again, and the same `Connection` value keeps working. `glite.connect` instead starts an actor linked to the caller.
+To open a database at startup and share it, connect in a long-lived process, such as your application's main process or a supervised worker, and pass the `Connection` to whoever needs it. glite has no dependencies besides the standard library and esqlite.
 
 ## Backups and migrations
 
@@ -143,24 +135,24 @@ esqlite returns TEXT and BLOB cells the same way, so glite tells them apart by t
 
 ## glite or sqlight?
 
-[sqlight](https://hex.pm/packages/sqlight) is the other SQLite package for Gleam on Erlang. It calls SQLite straight from the calling process, which is simpler and has less overhead per call. glite puts each connection behind an actor, which costs a message round trip per call and buys isolated transactions that other processes can't interleave with, timeouts that interrupt the running statement, a bounded queue, supervision, and typed errors. Pick sqlight for scripts and single-process use, and glite when many processes share a database in a long-running service.
+[sqlight](https://hex.pm/packages/sqlight) is the other SQLite package for Gleam on Erlang. Both call SQLite from the calling process. sqlight is smaller and leaves sharing a connection safely to you. glite adds isolated transactions that other processes can't interleave with, timeouts that interrupt the running statement, a bounded queue, recovery from callers that die, typed errors and a statement cache. Pick sqlight for scripts and single-process use, and glite when many processes share a database in a long-running service.
 
 ## Performance
 
 `make bench-sqlight` runs the same operations through both packages; CI runs it on every push and keeps the results as a build artifact.
 
-Mean time per operation on an in-memory database, from one CI run (GitHub's ubuntu-24.04 runner, OTP 29). Shared runners are noisy, so read the ratios, not the absolute numbers.
+Mean time per operation on an in-memory database, typical of several local runs on a 4-core VM with OTP 29. Shared machines are noisy, so read the ratios, not the absolute numbers.
 
 | Operation | glite | sqlight | glite / sqlight |
 | --- | ---: | ---: | ---: |
-| `SELECT ?` with one parameter | 20 µs | 26 µs | about the same (noise) |
-| Insert one row | 17 µs | 8 µs | 2.2× |
-| Select and decode 100 rows | 288 µs | 268 µs | 1.1× |
-| Select and decode 1,000 rows | 2.5 ms | 2.6 ms | about the same |
-| Transaction with 100 inserts | 1.05 ms | 0.63 ms | 1.7× |
-| 8 processes × 50 selects at once | 6.9 ms | 4.7 ms | 1.5× |
+| `SELECT ?` with one parameter | 9.3 µs | 12.2 µs | 0.8× |
+| Insert one row | 6.6 µs | 11.7 µs | 0.6× |
+| Select and decode 100 rows | 353 µs | 395 µs | 0.9× |
+| Select and decode 1,000 rows | 3.2 ms | 3.9 ms | 0.8× |
+| Transaction with 100 inserts | 0.47 ms | 1.03 ms | 0.5× |
+| 8 processes × 50 selects at once | 4.7 ms | 7.5 ms | 0.6× |
 
-The actor costs about 10 µs per call. That shows on tiny statements and on transactions of many small statements, and is lost in the noise once a query does real work. Under concurrency glite serializes every call through one actor, while sqlight's callers contend on SQLite's own lock; with WAL, a pool of read connections would close that gap.
+glite 0.4.0 sent every call to an actor that owned the connection, which cost about 10 µs per call: up to 2.2× slower than sqlight on small statements and 1.5× slower with 8 processes at once. Since 0.5.0 calls run in the calling process, which costs under 1 µs for the lock, and reusing prepared statements saves the 5 to 8 µs that scanning and preparing the SQL takes on every call, which sqlight still pays.
 
 ## Development
 

@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.5.0 - Unreleased
+
+### Changed
+
+- No more actor. Every call now runs in the calling process, holding the
+  connection's lock while it uses SQLite. Taking a free connection is one
+  atomic compare-and-swap; busy, callers queue in order with a small helper
+  process per connection, which also interrupts calls past their deadline
+  and cleans up after callers that die. Transactions are still isolated,
+  calls are still bounded by `call_timeout_ms`, and a queued call that times
+  out still never runs. The lock costs under 1 µs per call, against about
+  10 µs for the actor round trip.
+- Each connection caches its prepared statements, with the scanner's checks
+  for each, by SQL text: `config.statement_cache`, 200 by default, 0 to turn
+  it off. Scanning and preparing a small statement took longer than running
+  it. glite is now faster than sqlight on every benchmark in the README.
+- glite no longer depends on gleam_otp or gleam_erlang: only gleam_stdlib
+  and esqlite.
+- A process that dies while it holds the connection, even in the middle of a
+  transaction or a long query, no longer strands it: the helper interrupts
+  what it left running, rolls it back, and serves the next caller.
+- A connection closes when the process that called `connect` crashes, as
+  before, and stays open when it exits normally.
+- The README says glite is a personal project, without promises of support,
+  and that contributions and forks are welcome.
+
+### Removed
+
+- `glite.supervised`, `glite.named` and `glite.Message`. There is no actor
+  to supervise or restart: connect in a long-lived process and share the
+  `Connection`.
+- `config.interrupt_grace_ms`. A timed-out call is the process running it,
+  so there is nothing to wait for: the helper interrupts its SQL until it
+  lets go of the connection.
+
 ## v0.4.0 - 2026-11-05
 
 ### Fixed

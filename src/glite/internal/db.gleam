@@ -1,4 +1,4 @@
-//// Raw database operations. These run inside the connection actor only.
+//// Raw database operations. These run only while holding the connection.
 
 import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
@@ -13,8 +13,11 @@ import glite/error.{type Error}
 import glite/internal/sql as scanner
 import glite/value.{type Value}
 
-/// An open esqlite connection.
+/// An open esqlite connection and its cache of prepared statements.
 pub type Db
+
+/// A prepared statement, from the connection's cache or used once.
+type Statement
 
 /// The limits a running job needs. `deadline` is the caller's deadline in
 /// `monotonic_ms` time; a transaction refuses new statements after it.
@@ -95,7 +98,24 @@ type CopyFailure {
 }
 
 @external(erlang, "glite_sqlite_ffi", "open")
-fn ffi_open(path: String) -> Result(Db, Failure)
+fn ffi_open(path: String, statement_cache: Int) -> Result(Db, Failure)
+
+@external(erlang, "glite_sqlite_ffi", "cached")
+fn ffi_cached(
+  db: Db,
+  sql: String,
+) -> Result(#(Statement, scanner.Analysis), Nil)
+
+@external(erlang, "glite_sqlite_ffi", "prepare")
+fn ffi_prepare(
+  db: Db,
+  sql: String,
+  analysis: scanner.Analysis,
+) -> Result(Statement, Failure)
+
+/// Finalize and forget every cached statement.
+@external(erlang, "glite_sqlite_ffi", "clear_statements")
+pub fn clear_statements(db: Db) -> Nil
 
 @external(erlang, "glite_sqlite_ffi", "close")
 pub fn close(db: Db) -> Nil
@@ -112,7 +132,7 @@ fn ffi_exec_script(db: Db, sql: String) -> Result(Nil, Failure)
 @external(erlang, "glite_sqlite_ffi", "execute")
 fn ffi_execute(
   db: Db,
-  sql: String,
+  statement: Statement,
   params: List(Value),
   kind: scanner.Kind,
 ) -> Result(Int, Failure)
@@ -120,7 +140,7 @@ fn ffi_execute(
 @external(erlang, "glite_sqlite_ffi", "query")
 fn ffi_query(
   db: Db,
-  sql: String,
+  statement: Statement,
   params: List(Value),
   max_rows: Int,
 ) -> Result(#(List(String), List(String), List(List(Dynamic))), Failure)
@@ -128,7 +148,7 @@ fn ffi_query(
 @external(erlang, "glite_sqlite_ffi", "execute_many")
 fn ffi_execute_many(
   db: Db,
-  sql: String,
+  statement: Statement,
   params: List(List(Value)),
   kind: scanner.Kind,
 ) -> Result(Int, Failure)
@@ -146,13 +166,39 @@ pub fn exec_script(db: Db, sql: String) -> Result(Nil, Error) {
 
 /// Run one statement and return the number of rows it changed.
 pub fn exec(db: Db, sql: String, params: List(Value)) -> Result(Int, Error) {
-  use analysis <- result.try(scanner.analyze(sql))
-  use Nil <- result.try(check_params(params, analysis.params))
-  ffi_execute(db, sql, params, analysis.kind) |> result.map_error(from_failure)
+  use #(statement, analysis) <- result.try(
+    statement(db, sql, check_params(params, _)),
+  )
+  ffi_execute(db, statement, params, analysis.kind)
+  |> result.map_error(from_failure)
 }
 
-/// Write a copy of the database to `path` with `VACUUM INTO`. Runs in the
-/// actor.
+/// The prepared statement for `sql`, from the cache, or checked, prepared and
+/// cached. `check` sees the statement's analysis before it runs: SQL that
+/// doesn't pass it is never prepared.
+fn statement(
+  db: Db,
+  sql: String,
+  check: fn(scanner.Analysis) -> Result(Nil, Error),
+) -> Result(#(Statement, scanner.Analysis), Error) {
+  case ffi_cached(db, sql) {
+    Ok(#(statement, analysis)) -> {
+      use Nil <- result.map(check(analysis))
+      #(statement, analysis)
+    }
+    Error(Nil) -> {
+      use analysis <- result.try(scanner.analyze(sql))
+      use Nil <- result.try(check(analysis))
+      use statement <- result.map(
+        ffi_prepare(db, sql, analysis) |> result.map_error(from_failure),
+      )
+      #(statement, analysis)
+    }
+  }
+}
+
+/// Write a copy of the database to `path` with `VACUUM INTO`. Runs holding
+/// the connection.
 pub fn backup(db: Db, path: String) -> Result(Nil, Error) {
   case ffi_backup(db, path) {
     Ok(Nil) -> Ok(Nil)
@@ -174,9 +220,8 @@ pub fn query(
   sql: String,
   params: List(Value),
 ) -> Result(Rows, Error) {
-  use analysis <- result.try(scanner.analyze(sql))
-  use Nil <- result.try(check_params(params, analysis.params))
-  case ffi_query(db, sql, params, limits.max_rows) {
+  use #(statement, _) <- result.try(statement(db, sql, check_params(params, _)))
+  case ffi_query(db, statement, params, limits.max_rows) {
     Error(failure) -> Error(from_failure(failure))
     Ok(#(columns, types, rows)) -> {
       let kinds = list.map(types, column_kind)
@@ -227,9 +272,12 @@ pub fn exec_many(
     True -> Error(error.BatchLimitExceeded(limits.max_batch))
     False -> Ok(Nil)
   })
-  use analysis <- result.try(scanner.analyze(sql))
-  use Nil <- result.try(list.try_each(params, check_params(_, analysis.params)))
-  ffi_execute_many(db, sql, params, analysis.kind)
+  use #(statement, analysis) <- result.try(
+    statement(db, sql, fn(analysis) {
+      list.try_each(params, check_params(_, analysis))
+    }),
+  )
+  ffi_execute_many(db, statement, params, analysis.kind)
   |> result.map_error(from_failure)
 }
 
@@ -275,10 +323,17 @@ fn decode_rows(
 pub fn validate(config: Config) -> Result(Nil, Error) {
   use _ <- result.try(positive("busy_timeout_ms", config.busy_timeout_ms))
   use _ <- result.try(positive("call_timeout_ms", config.call_timeout_ms))
-  use _ <- result.try(positive("interrupt_grace_ms", config.interrupt_grace_ms))
   use _ <- result.try(positive("max_rows", config.max_rows))
   use _ <- result.try(positive("max_batch", config.max_batch))
   use _ <- result.try(positive("max_queue", config.max_queue))
+  use _ <- result.try(case config.statement_cache >= 0 {
+    True -> Ok(Nil)
+    False ->
+      Error(error.InvalidConfig(
+        "statement_cache must be 0 or more, got "
+        <> int.to_string(config.statement_cache),
+      ))
+  })
   use _ <- result.try(case config.busy_timeout_ms < config.call_timeout_ms {
     True -> Ok(Nil)
     False ->
@@ -310,7 +365,10 @@ pub fn validate(config: Config) -> Result(Nil, Error) {
 /// took effect.
 pub fn open(config: Config) -> Result(Db, Error) {
   use _ <- result.try(validate(config))
-  use db <- result.try(ffi_open(config.path) |> result.map_error(from_failure))
+  use db <- result.try(
+    ffi_open(config.path, config.statement_cache)
+    |> result.map_error(from_failure),
+  )
   case configure(db, config) {
     Ok(Nil) -> Ok(db)
     Error(e) -> {
@@ -426,7 +484,11 @@ const int64_max = 9_223_372_036_854_775_807
 
 /// The parameters must match the statement's placeholders, because SQLite
 /// binds missing ones as NULL, and integers must fit in 64 bits.
-fn check_params(params: List(Value), expected: Int) -> Result(Nil, Error) {
+fn check_params(
+  params: List(Value),
+  analysis: scanner.Analysis,
+) -> Result(Nil, Error) {
+  let expected = analysis.params
   let given = list.length(params)
   use Nil <- result.try(case given == expected {
     True -> Ok(Nil)

@@ -1,10 +1,10 @@
 //// Statements inside a transaction.
 ////
-//// A transaction's callback runs inside the connection's actor and gets a
-//// `Tx`. Nothing else uses the connection until the callback returns, so no
-//// other caller's statements can mix into the transaction. Use only the `Tx`
-//// inside the callback: calling the `Connection` from there panics, because
-//// the connection is busy running the callback.
+//// A transaction's callback runs in the calling process, holding the
+//// connection, and gets a `Tx`. Nothing else uses the connection until the
+//// callback returns, so no other caller's statements can mix into the
+//// transaction. Use only the `Tx` inside the callback: calling the
+//// `Connection` from there panics, because the callback holds it.
 ////
 //// Once the call's `call_timeout_ms` has passed, every statement on the `Tx`
 //// returns `Timeout` without running, so a body that keeps going after a

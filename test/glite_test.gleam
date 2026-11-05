@@ -1,3 +1,4 @@
+import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
 import gleeunit
@@ -306,7 +307,7 @@ pub fn integer_beyond_64_bits_is_an_encode_error_test() {
       [glite.int(9_223_372_036_854_775_808)],
       int_column(),
     )
-  // The actor survived.
+  // The connection still works.
   let assert Ok(1) = glite.query_one(conn, "SELECT 1", [], int_column())
 }
 
@@ -333,6 +334,72 @@ pub fn blob_column_returns_blob_test() {
     ])
   let assert Ok(rows) = glite.query_rows(conn, "SELECT data FROM f", [])
   let assert [[value.Blob(<<"abc":utf8>>)]] = rows.rows
+}
+
+pub fn statement_cache_keeps_working_when_full_test() {
+  let assert Ok(conn) =
+    glite.connect(config.memory() |> config.statement_cache(2))
+  let queries = ["SELECT 1 + ?", "SELECT 2 + ?", "SELECT 3 + ?", "SELECT 4 + ?"]
+  [1, 2, 3]
+  |> list.each(fn(_) {
+    list.index_map(queries, fn(sql, i) {
+      let assert Ok(n) =
+        glite.query_one(conn, sql, [glite.int(10)], int_column())
+      let assert True = n == i + 11
+    })
+  })
+  let assert Ok(Nil) = glite.disconnect(conn)
+}
+
+pub fn statement_cache_can_be_off_test() {
+  let assert Ok(conn) =
+    glite.connect(config.memory() |> config.statement_cache(0))
+  let assert Ok(1) =
+    glite.query_one(conn, "SELECT ?", [glite.int(1)], int_column())
+  let assert Ok(2) =
+    glite.query_one(conn, "SELECT ?", [glite.int(2)], int_column())
+  let assert Error(error.InvalidConfig(_)) =
+    glite.connect(config.memory() |> config.statement_cache(-1))
+}
+
+pub fn cached_statement_sees_schema_changes_test() {
+  let assert Ok(conn) = glite.connect(config.memory())
+  let assert Ok(Nil) =
+    glite.exec_script(
+      conn,
+      "CREATE TABLE t (a TEXT); INSERT INTO t VALUES ('x')",
+    )
+  let assert Ok(["x"]) = glite.query(conn, "SELECT * FROM t", [], text_column())
+  let assert Ok(Nil) =
+    glite.exec_script(
+      conn,
+      "DROP TABLE t; CREATE TABLE t (b INTEGER); INSERT INTO t VALUES (7)",
+    )
+  let assert Ok(rows) = glite.query_rows(conn, "SELECT * FROM t", [])
+  let assert True = rows.columns == ["b"]
+  let assert [[value.Integer(7)]] = rows.rows
+}
+
+pub fn a_query_stopped_early_leaves_no_read_lock_test() {
+  use path <- helpers.with_file("early")
+  let assert Ok(reader) = glite.connect(config.new(path) |> config.max_rows(1))
+  let assert Ok(writer) = glite.connect(config.new(path))
+  let assert Ok(Nil) =
+    glite.exec_script(
+      writer,
+      "CREATE TABLE t (x); INSERT INTO t VALUES (1), (2)",
+    )
+  // Stops at the row limit with rows left: the cached statement is reset, so
+  // it doesn't keep a read snapshot open and a checkpoint can run.
+  let assert Error(error.RowLimitExceeded(1)) =
+    glite.query(reader, "SELECT x FROM t", [], int_column())
+  let assert Ok(1) = glite.exec(writer, "INSERT INTO t VALUES (3)", [])
+  let assert Ok(Nil) =
+    glite.exec_script(writer, "PRAGMA wal_checkpoint(TRUNCATE)")
+  let assert Ok([3]) =
+    glite.query(reader, "SELECT count(*) FROM t", [], int_column())
+  let assert Ok(Nil) = glite.disconnect(reader)
+  let assert Ok(Nil) = glite.disconnect(writer)
 }
 
 pub fn user_version_test() {

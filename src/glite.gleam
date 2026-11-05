@@ -1,9 +1,10 @@
 //// glite: a SQLite driver for Gleam on the Erlang VM.
 ////
-//// One connection is one actor that owns the SQLite handle and runs every
-//// call on it, one at a time. Share a `Connection` between processes freely:
-//// calls queue up, and a transaction runs as one call, so nothing else can
-//// mix into it.
+//// Every call runs in the calling process, holding the connection for as long
+//// as it uses SQLite, so callers use it one at a time. Share a `Connection`
+//// between processes freely: when it is busy, calls queue up in order, and a
+//// transaction holds it from BEGIN to COMMIT, so nothing else can mix into
+//// it.
 ////
 //// ```gleam
 //// import glite
@@ -29,23 +30,14 @@
 //// ```
 
 import gleam/dynamic.{type Dynamic}
-import gleam/erlang/process.{type Name, type Pid, type Subject}
 import gleam/option.{type Option, None, Some}
-import gleam/otp/actor as otp_actor
-import gleam/otp/supervision
 import gleam/result
 import glite/config.{type Config}
 import glite/decode.{type RowDecoder}
 import glite/error.{type Error}
-import glite/internal/actor.{type Handle, type Token, Handle}
 import glite/internal/db.{type Db}
 import glite/tx.{type Tx}
 import glite/value.{type Value}
-
-/// A message to a connection's actor. Use it to name a supervised
-/// connection: `process.new_name("db")` gives a `Name(glite.Message)`.
-pub type Message =
-  actor.Message
 
 /// A query parameter.
 pub type Param =
@@ -55,14 +47,13 @@ pub type Param =
 pub type Rows =
   db.Rows
 
-/// A connection to one SQLite database.
+/// A connection to one SQLite database. Share it between processes freely.
 pub opaque type Connection {
-  /// Started with `connect`: the handle never changes.
-  Direct(subject: Subject(Message), handle: Handle)
-  /// Started by a supervisor: the handle is looked up by name on each call,
-  /// so a restarted actor is picked up.
-  Registered(name: Name(Message))
+  Connection(lock: Lock, db: Db, config: Config)
 }
+
+/// The connection's lock and its helper process (see `glite_ffi`).
+type Lock
 
 /// How a transaction takes its locks.
 pub type TransactionMode {
@@ -92,66 +83,21 @@ pub type Backup {
 // Connecting
 // =============================================================================
 
-/// Open a database and start its actor, linked to the calling process. Every
-/// setting in the config is checked after opening; if SQLite didn't apply
-/// one, such as WAL mode, this returns `PragmaMismatch`.
-pub fn connect(config: Config) -> Result(Connection, Error) {
-  use db <- result.try(db.open(config))
-  let counters = actor.new_counters()
-  case actor.start_with(db, counters) {
-    Ok(started) ->
-      Ok(Direct(
-        subject: started.data,
-        handle: Handle(pid: started.pid, db:, counters:, config:),
-      ))
-    Error(_) -> {
-      db.close(db)
-      Error(error.ConnectionClosed)
-    }
-  }
-}
-
-/// A child specification for a supervisor. The connection's actor registers
-/// under `name`; get a `Connection` for it with `named`. If the actor
-/// crashes, the supervisor restarts it, which opens the database again.
+/// Open a database. Every setting in the config is checked after opening; if
+/// SQLite didn't apply one, such as WAL mode, this returns `PragmaMismatch`.
 ///
-/// ```gleam
-/// let db_name = process.new_name("db")
-/// let assert Ok(_) =
-///   static_supervisor.new(static_supervisor.OneForOne)
-///   |> static_supervisor.add(glite.supervised(config, db_name))
-///   |> static_supervisor.start
-/// let conn = glite.named(db_name)
-/// ```
-pub fn supervised(
-  config: Config,
-  name: Name(Message),
-) -> supervision.ChildSpecification(Connection) {
-  supervision.worker(fn() {
-    case actor.start_named(config, name) {
-      Ok(started) -> Ok(otp_actor.Started(pid: started.pid, data: named(name)))
-      Error(e) -> Error(e)
-    }
-  })
+/// The connection stays open until `disconnect`, or until the process that
+/// called `connect` crashes. A process that exits normally leaves it open.
+pub fn connect(config: Config) -> Result(Connection, Error) {
+  use db <- result.map(db.open(config))
+  Connection(lock: start(db, config.max_queue), db:, config:)
 }
 
-/// A connection to the supervised actor registered under `name`. Calls
-/// return `ConnectionClosed` while no actor is registered.
-pub fn named(name: Name(Message)) -> Connection {
-  Registered(name:)
-}
-
-/// Close the database and stop the actor. Closing a connection that is
-/// already closed returns `Ok(Nil)`. Stopping a supervised connection makes
-/// its supervisor start a new one; stop the supervisor instead.
+/// Close the database, after the call or transaction running on it, if any,
+/// finishes. Closing a connection that is already closed returns `Ok(Nil)`;
+/// calls on a closed connection return `ConnectionClosed`.
 pub fn disconnect(conn: Connection) -> Result(Nil, Error) {
-  let stop = fn(id, deadline, token, _limits) {
-    actor.Stop(id:, deadline:, reply: token)
-  }
-  case call_with(conn, Plain, stop) {
-    Error(error.ConnectionClosed) -> Ok(Nil)
-    other -> other
-  }
+  ffi_disconnect(conn.lock, conn.config.call_timeout_ms)
 }
 
 // =============================================================================
@@ -223,18 +169,20 @@ pub fn query_rows(
 /// returns `Error` or panics. A panic is rolled back and then re-raised in
 /// the calling process.
 ///
-/// The body runs inside the connection's actor, so no other caller's
-/// statements can mix into the transaction. Use the `Tx` it gets, not the
-/// `Connection`: calling the connection from inside the body panics.
+/// The body runs in the calling process while it holds the connection, so no
+/// other caller's statements can mix into the transaction. Use the `Tx` it
+/// gets, not the `Connection`: calling the connection from inside the body
+/// panics.
 ///
 /// The whole transaction must finish within `call_timeout_ms`. If it
 /// doesn't, its running statement is interrupted, it is rolled back, and the
 /// result is `Database(Timeout(_))`.
 ///
 /// A timeout can interrupt SQL but nothing else. A body that waits for a
-/// message, loops, or calls a slow service keeps the connection busy until it
-/// returns, so keep the body to statements on the `Tx` and quick Gleam code,
-/// and never call another glite connection from it.
+/// message, loops, or calls a slow service keeps the connection busy, and
+/// the caller waiting, until it returns, so keep the body to statements on
+/// the `Tx` and quick Gleam code, and never call another glite connection
+/// from it.
 pub fn transaction(
   conn: Connection,
   mode: TransactionMode,
@@ -245,10 +193,8 @@ pub fn transaction(
     Deferred -> "BEGIN DEFERRED"
     Exclusive -> "BEGIN EXCLUSIVE"
   }
-  call_with(conn, InTransaction, fn(id, deadline, token, limits) {
-    actor.Run(id:, deadline:, reply: token, job: fn(db) {
-      to_dynamic(run_transaction(db, limits, begin, body))
-    })
+  call(conn, InTransaction, fn(db, limits) {
+    run_transaction(db, limits, begin, body)
   })
 }
 
@@ -347,7 +293,7 @@ pub fn nullable(value: Option(a), to_param: fn(a) -> Param) -> Param {
 }
 
 // =============================================================================
-// Calling the actor
+// Calling the connection
 // =============================================================================
 
 type Wrap {
@@ -355,109 +301,68 @@ type Wrap {
   InTransaction
 }
 
+@external(erlang, "glite_ffi", "start")
+fn start(db: Db, max_queue: Int) -> Lock
+
+@external(erlang, "glite_ffi", "disconnect")
+fn ffi_disconnect(lock: Lock, timeout: Int) -> Result(Nil, Error)
+
+@external(erlang, "glite_ffi", "holding")
+fn holding(lock: Lock) -> Bool
+
+/// Takes the lock, runs `job` with the call's deadline, and lets go. Returns
+/// what `job` returned, or glite's own error shaped by `wrap`; re-raises a
+/// panic in `job` after `cleanup` has rolled back.
+@external(erlang, "glite_ffi", "call")
+fn ffi_call(
+  lock: Lock,
+  timeout: Int,
+  wrap: Wrap,
+  job: fn(Int) -> Dynamic,
+  cleanup: fn() -> Nil,
+) -> Dynamic
+
 @external(erlang, "glite_ffi", "coerce")
 fn to_dynamic(value: a) -> Dynamic
 
 @external(erlang, "glite_ffi", "coerce")
 fn from_dynamic(value: Dynamic) -> a
 
-@external(erlang, "glite_ffi", "admit")
-fn admit(counters: actor.Counters, max_queue: Int) -> Result(Nil, Error)
-
-@external(erlang, "glite_ffi", "prepare_call")
-fn prepare_call(pid: Pid) -> Token
-
-@external(erlang, "glite_ffi", "await")
-fn await(
-  token: Token,
-  id: Int,
-  db: Db,
-  counters: actor.Counters,
-  timeout: Int,
-  grace: Int,
-  wrap: Wrap,
-) -> a
-
-@external(erlang, "glite_ffi", "monotonic_ms")
-fn monotonic_ms() -> Int
-
-@external(erlang, "glite_ffi", "unique_id")
-fn unique_id() -> Int
-
-@external(erlang, "glite_ffi", "get_named")
-fn get_named(name: Name(Message)) -> Result(Handle, Nil)
-
 fn run(
   conn: Connection,
   job: fn(Db, db.Limits) -> Result(a, Error),
 ) -> Result(a, Error) {
-  call_with(conn, Plain, fn(id, deadline, token, limits) {
-    actor.Run(id:, deadline:, reply: token, job: fn(db) {
-      to_dynamic(job(db, limits))
-    })
-  })
+  call(conn, Plain, job)
 }
 
-/// Send a message to the actor and wait for the reply, within the call
-/// timeout. Never panics on its own: a stopped actor is `ConnectionClosed`
-/// and a slow call is `Timeout`. A panic inside the job is re-raised here.
-fn call_with(
+/// Run `job` holding the connection, within the call timeout. Never panics
+/// on its own: a closed connection is `ConnectionClosed` and a slow call is
+/// `Timeout`. A panic inside the job is re-raised here.
+///
+/// `wrap` says how glite's own errors are shaped: `Plain` as `Error(e)`, so
+/// `b` is `Error`; `InTransaction` as `Error(Database(e))`, so `b` is
+/// `TransactionError(_)`.
+fn call(
   conn: Connection,
   wrap: Wrap,
-  message: fn(Int, Int, Token, db.Limits) -> Message,
+  job: fn(Db, db.Limits) -> Result(a, b),
 ) -> Result(a, b) {
-  case resolve(conn) {
-    Error(e) -> closed(e, wrap)
-    Ok(#(subject, handle)) -> {
-      case handle.pid == process.self() {
-        True ->
-          panic as "glite: a Connection was called from inside its own transaction; use the Tx instead"
-        False -> Nil
-      }
-      case admit(handle.counters, handle.config.max_queue) {
-        Error(e) -> closed(e, wrap)
-        Ok(Nil) -> {
-          let timeout = handle.config.call_timeout_ms
-          let id = unique_id()
-          let deadline = monotonic_ms() + timeout
-          let token = prepare_call(handle.pid)
-          let limits = db.limits(handle.config, deadline)
-          process.send(subject, message(id, deadline, token, limits))
-          await(
-            token,
-            id,
-            handle.db,
-            handle.counters,
-            timeout,
-            handle.config.interrupt_grace_ms,
-            wrap,
-          )
-        }
-      }
+  case holding(conn.lock) {
+    True ->
+      panic as "glite: a Connection was called from inside its own transaction; use the Tx instead"
+    False -> Nil
+  }
+  let Connection(lock:, db:, config:) = conn
+  let job = fn(deadline) {
+    let result = job(db, db.limits(config, deadline))
+    // Every job leaves the connection in autocommit mode: one that returned
+    // with a transaction still open is a bug in glite. The panic rolls it
+    // back through `cleanup`.
+    case db.autocommit(db) {
+      True -> to_dynamic(result)
+      False -> panic as "glite: a job left a transaction open"
     }
   }
-}
-
-fn closed(e: Error, wrap: Wrap) -> Result(a, b) {
-  case wrap {
-    Plain -> Error(from_dynamic(to_dynamic(e)))
-    InTransaction -> Error(from_dynamic(to_dynamic(Database(e))))
-  }
-}
-
-fn resolve(conn: Connection) -> Result(#(Subject(Message), Handle), Error) {
-  case conn {
-    Direct(subject:, handle:) -> Ok(#(subject, handle))
-    Registered(name:) -> {
-      use handle <- result.try(
-        get_named(name) |> result.replace_error(error.ConnectionClosed),
-      )
-      // Between a crash and the restart the published handle is stale.
-      case process.named(name) {
-        Ok(pid) if pid == handle.pid ->
-          Ok(#(process.named_subject(name), handle))
-        _ -> Error(error.ConnectionClosed)
-      }
-    }
-  }
+  ffi_call(lock, config.call_timeout_ms, wrap, job, fn() { db.rollback(db) })
+  |> from_dynamic
 }

@@ -1,4 +1,5 @@
 /// Benchmark harness — extracts stats from gleamy_bench results and writes JSON.
+import envoy
 import gleam/float
 import gleam/int
 import gleam/io
@@ -6,7 +7,6 @@ import gleam/json
 import gleam/list
 import gleam/result
 import gleam/string
-import envoy
 import gleam/time/calendar
 import gleam/time/timestamp
 import gleamy/bench

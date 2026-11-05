@@ -228,9 +228,7 @@ pub fn exec_many(
     False -> Ok(Nil)
   })
   use analysis <- result.try(scanner.analyze(sql))
-  use Nil <- result.try(
-    list.try_each(params, check_params(_, analysis.params)),
-  )
+  use Nil <- result.try(list.try_each(params, check_params(_, analysis.params)))
   ffi_execute_many(db, sql, params, analysis.kind)
   |> result.map_error(from_failure)
 }
@@ -312,9 +310,7 @@ pub fn validate(config: Config) -> Result(Nil, Error) {
 /// took effect.
 pub fn open(config: Config) -> Result(Db, Error) {
   use _ <- result.try(validate(config))
-  use db <- result.try(
-    ffi_open(config.path) |> result.map_error(from_failure),
-  )
+  use db <- result.try(ffi_open(config.path) |> result.map_error(from_failure))
   case configure(db, config) {
     Ok(Nil) -> Ok(db)
     Error(e) -> {
@@ -450,9 +446,7 @@ fn check_param(param: Value) -> Result(Nil, Error) {
   case param {
     value.Integer(n) if n < int64_min || n > int64_max -> {
       let n = int.to_string(n)
-      Error(error.Encode(
-        "integer " <> n <> " does not fit in SQLite's 64 bits",
-      ))
+      Error(error.Encode("integer " <> n <> " does not fit in SQLite's 64 bits"))
     }
     _ -> Ok(Nil)
   }
@@ -528,13 +522,7 @@ fn from_failure(failure: Failure) -> Error {
           error.Constraint(constraint_kind(code), message)
         _ if primary == sqlite_busy || primary == sqlite_locked ->
           error.Busy(message)
-        _ ->
-          error.Sqlite(
-            code: primary,
-            extended_code: code,
-            message:,
-            offset:,
-          )
+        _ -> error.Sqlite(code: primary, extended_code: code, message:, offset:)
       }
     }
   }

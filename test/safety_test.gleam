@@ -135,7 +135,9 @@ pub fn scanner_test() {
        END;",
     )
   let assert Ok(#(0, "other")) =
-    helpers.analyze("CREATE TEMP TRIGGER t AFTER INSERT ON a BEGIN SELECT 1; END")
+    helpers.analyze(
+      "CREATE TEMP TRIGGER t AFTER INSERT ON a BEGIN SELECT 1; END",
+    )
   let assert Error(_) =
     helpers.analyze(
       "CREATE TRIGGER t AFTER INSERT ON a BEGIN SELECT 1; END; SELECT 2",

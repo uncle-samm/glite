@@ -31,7 +31,8 @@ const select_1000 = "SELECT id, val, name FROM items WHERE id <= 1000"
 
 const select_by_id = "SELECT val FROM items WHERE id = ?"
 
-const fill = "WITH RECURSIVE n(i) AS (
+const fill =
+  "WITH RECURSIVE n(i) AS (
   SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000
 )
 INSERT INTO items (id, val, name) SELECT i, i, 'row_' || i FROM n"

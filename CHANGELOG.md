@@ -39,6 +39,8 @@
   sqlight.
 - `make check` now runs everything CI and the release workflow run, and both
   workflows call it.
+- Releases are published from GitHub releases instead of `make release`:
+  publishing a release tagged `vX.Y.Z` on GitHub publishes to Hex.
 
 ## v0.3.1 - 2026-11-05
 

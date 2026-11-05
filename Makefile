@@ -1,7 +1,7 @@
 # The commit the benchmarks report.
 export GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null)
 
-.PHONY: build test format check docs release bench bench-integration bench-sqlight bench-go-sqlite bench-compare
+.PHONY: build test format check docs bench bench-integration bench-sqlight bench-go-sqlite bench-compare
 
 build:
 	gleam build
@@ -23,11 +23,6 @@ check:
 
 docs:
 	gleam docs build
-
-# Tag the version in gleam.toml and push the tag; the Release workflow tests
-# it and publishes it to Hex.
-release:
-	sh scripts/release.sh
 
 bench: bench-integration bench-sqlight bench-go-sqlite
 

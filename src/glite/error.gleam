@@ -41,6 +41,13 @@ pub type Error {
   Backup(message: String)
   /// The connection is closed, or the process that opened it crashed.
   ConnectionClosed
+  /// The transaction ended before its body did, so the statement was not
+  /// run: outside the transaction it would have been committed by itself.
+  /// SQLite rolls a transaction back on its own after `ON CONFLICT ROLLBACK`,
+  /// `RAISE(ROLLBACK)`, a full disk or an I/O error, and SQL in the body
+  /// that says COMMIT or ROLLBACK ends it too. A transaction whose body
+  /// still returns `Ok` after that fails with this error.
+  TransactionEnded
 }
 
 /// The kind of constraint that failed.
@@ -91,6 +98,7 @@ pub fn describe(error: Error) -> String {
     InvalidConfig(message:) -> "invalid config: " <> message
     Backup(message:) -> "backup failed: " <> message
     ConnectionClosed -> "connection closed"
+    TransactionEnded -> "the transaction ended before its body did"
   }
 }
 

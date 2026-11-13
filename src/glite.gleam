@@ -43,9 +43,9 @@ import glite/value.{type Value}
 pub type Param =
   Value
 
-/// Column names and raw rows from `query_rows`.
+/// Column names and raw rows from `query_rows`: `glite/value`'s `Rows`.
 pub type Rows =
-  db.Rows
+  value.Rows
 
 /// A connection to one SQLite database. Share it between processes freely.
 pub opaque type Connection {
@@ -96,8 +96,16 @@ pub fn connect(config: Config) -> Result(Connection, Error) {
 /// Close the database, after the call or transaction running on it, if any,
 /// finishes. Closing a connection that is already closed returns `Ok(Nil)`;
 /// calls on a closed connection return `ConnectionClosed`.
+///
+/// Like any other call on the connection, this panics inside one of the
+/// connection's own transactions: it would wait for that transaction to
+/// finish.
 pub fn disconnect(conn: Connection) -> Result(Nil, Error) {
-  ffi_disconnect(conn.lock, conn.config.call_timeout_ms)
+  case holding(conn.lock) {
+    True ->
+      panic as "glite: disconnect was called from inside the connection's own transaction; return from the transaction first"
+    False -> ffi_disconnect(conn.lock, conn.config.call_timeout_ms)
+  }
 }
 
 // =============================================================================
@@ -174,6 +182,14 @@ pub fn query_rows(
 /// gets, not the `Connection`: calling the connection from inside the body
 /// panics.
 ///
+/// If SQLite ends the transaction before the body does, as `ON CONFLICT
+/// ROLLBACK`, `RAISE(ROLLBACK)`, a full disk and I/O errors do, the body's
+/// later statements return `TransactionEnded` without running, and the
+/// result is `Database(TransactionEnded)` even if the body returns `Ok`.
+///
+/// The `Tx` only works inside the body, in the process running it: using it
+/// later, or from another process, panics.
+///
 /// The whole transaction must finish within `call_timeout_ms`. If it
 /// doesn't, its running statement is interrupted, it is rolled back, and the
 /// result is `Database(Timeout(_))`.
@@ -206,9 +222,16 @@ fn run_transaction(
 ) -> Result(a, TransactionError(e)) {
   case db.exec_script(db, begin) {
     Error(e) -> Error(Database(e))
-    Ok(Nil) ->
-      case body(tx.new(db, limits)) {
-        Ok(value) ->
+    Ok(Nil) -> {
+      let result =
+        db.in_transaction(fn(token) { body(tx.new(db, limits, token)) })
+      case result, db.autocommit(db) {
+        // The transaction ended before its body did: SQLite rolled it back
+        // by itself, or SQL in the body ended it. There is nothing left to
+        // commit, and reporting `Ok` would say that all of the body's work
+        // was kept.
+        Ok(_), True -> Error(Database(error.TransactionEnded))
+        Ok(value), False ->
           case db.exec_script(db, "COMMIT") {
             Ok(Nil) -> Ok(value)
             Error(e) -> {
@@ -216,11 +239,12 @@ fn run_transaction(
               Error(Database(e))
             }
           }
-        Error(e) -> {
+        Error(e), _ -> {
           db.rollback(db)
           Error(RolledBack(e))
         }
       }
+    }
   }
 }
 

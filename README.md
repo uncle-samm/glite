@@ -68,7 +68,9 @@ glite.transaction(conn, glite.Immediate, fn(t) {
 })
 ```
 
-Use `Immediate` for any transaction that writes. Calling the `Connection` from inside its own transaction body panics with a clear message; use the `Tx`.
+Use `Immediate` for any transaction that writes. Calling the `Connection` from inside its own transaction body, `disconnect` included, panics with a clear message; use the `Tx`. The `Tx` only works inside the body, in the process running it: using one that was kept after the body returned, or sent to another process, panics too, because its statements would run without holding the connection.
+
+SQLite sometimes ends a transaction by itself: `ON CONFLICT ROLLBACK`, `RAISE(ROLLBACK)`, a full disk and I/O errors roll the whole transaction back. From then on every statement on the `Tx` returns `TransactionEnded` without running, because outside the transaction each one would be committed on its own, and the transaction's result is `Database(TransactionEnded)` even if the body returns `Ok`.
 
 The body runs in the calling process while it holds the connection, so keep it to SQL on the `Tx` and quick Gleam code. A timeout can interrupt SQL, but not anything else: a body that waits for a message, loops, or calls another slow service keeps the connection busy, and its caller waiting, until it finishes, and every other caller waits behind it. Once the deadline has passed, every statement on the `Tx` returns `Timeout` without running. Don't call a second glite connection from a transaction body either: if that connection's transaction calls back into the first, both wait for each other until they time out.
 
@@ -99,6 +101,7 @@ glite.exec_many(conn, "INSERT INTO tags (name) VALUES (?)", [
 
 - **One statement per call.** `exec`, `query` and `query_one` take exactly one statement; a second one is `InvalidSql`, never silently dropped. Use `exec_script` for several statements without parameters, such as migrations.
 - **Parameters match placeholders.** The number of parameters must equal the statement's placeholders (`?`, `?NNN`, `:name`, `@name`, `$name`), and integers must fit in 64 bits. Otherwise it's `Encode`.
+- **`$1` means the first value.** SQLite reads `$1`, `:1` and `@1` as names, not numbers, and numbers names in the order they first appear. Written in order, as in `WHERE a = $1 AND b = $2`, they take the values you expect. `SELECT $2, $1` would bind them the other way round, so it is `InvalidSql`; use `?1` and `?2`, which are numbered by their number.
 - **Settings take effect.** `connect` reads back `journal_mode`, `synchronous`, `foreign_keys` and `busy_timeout` after setting them, and returns `PragmaMismatch` if SQLite didn't apply one. Asking for WAL on an in-memory database fails instead of quietly staying in memory mode.
 
 ## Limits
@@ -107,12 +110,12 @@ Every limit is in the config, and reaching one is an error, never a silent trunc
 
 | Setting | Default | When it's reached |
 | --- | --- | --- |
-| `call_timeout_ms` | 10,000 | `Timeout`; the statement is interrupted |
+| `call_timeout_ms` | 10,000 | `Timeout`; the statement is interrupted, and an `exec_many` batch stops between two runs |
 | `busy_timeout_ms` | 5,000 | `Busy`; must be shorter than the call timeout |
 | `max_rows` | 10,000 | `RowLimitExceeded`; no rows are returned |
 | `max_batch` | 10,000 | `BatchLimitExceeded` for `exec_many` |
 | `max_queue` | 1,000 | `Overloaded`; the call doesn't wait |
-| `statement_cache` | 200 | A cached statement is finalized to make room for a new one |
+| `statement_cache` | 200 | The statement cached longest is finalized to make room for a new one |
 
 `config.new(path)` uses WAL, `synchronous=FULL` (a committed transaction survives a power cut) and foreign keys on. `config.memory()` is the same for a private in-memory database.
 
@@ -131,7 +134,9 @@ To open a database at startup and share it, connect in a long-lived process, suc
 
 Parameters are built with `glite.int`, `float`, `text`, `blob`, `bool` (stored as 0 or 1), `null` and `nullable`. Rows are decoded by column index with `glite/decode`, which also has `map`, `then` and `fail` for rows whose shape depends on a column. A decode error says which row and column failed. If you also use `gleam/dynamic/decode`, import glite's as `import glite/decode as row`.
 
-esqlite returns TEXT and BLOB cells the same way, so glite tells them apart by the column's declared type: a column declared with `BLOB` in its type returns `Blob`. Anything that isn't valid UTF-8 is always `Blob`, so a `String` never holds invalid UTF-8, and `decode.blob` accepts text as well.
+esqlite returns TEXT and BLOB cells the same way, so glite tells them apart by the column's declared type: a column declared with `BLOB` in its type returns `Blob`, and anything else returns `Text` when it is valid UTF-8. That is a guess for text stored in a `BLOB` column and for expressions such as `SELECT x'68656C6C6F'`, so `decode.text` accepts a blob that is valid UTF-8 and `decode.blob` accepts text. Anything that isn't valid UTF-8 is always `Blob`, so a `String` never holds invalid UTF-8. `glite.query_rows` returns the raw values as `glite/value`'s `Rows`.
+
+An infinite REAL, such as `9e999` or the result of `1e308 * 10`, can be stored and compared but not read: the Erlang VM has no float for it. Reading a row that holds one is a `Decode` error naming the row; select the column with `CAST(x AS TEXT)` to get `Inf` or `-Inf`.
 
 ## Other Gleam SQLite packages
 

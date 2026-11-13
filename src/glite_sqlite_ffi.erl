@@ -11,7 +11,7 @@
 -export([
     open/2, close/1, autocommit/1, interrupt/1, clear_statements/1, give_away/2,
     cached/2, prepare/3,
-    exec_script/2, execute/4, query/4, execute_many/4,
+    exec_script/2, execute/4, query/4, execute_many/5,
     backup/2, verify_backup/1
 ]).
 
@@ -21,17 +21,26 @@
 %% so each one is kept and reused. The cache is an ETS table because every
 %% process that holds the connection's lock uses it; glite_ffi:start/2 gives
 %% it to the connection's helper, which outlives the callers.
--record(db, {raw, cache, cache_size}).
+%%
+%% `order` lists the cached statements oldest first, as {Sequence, Sql}, so
+%% a full cache drops the statement it has held longest. Looking a statement
+%% up never touches it, so a cache hit costs one ETS read.
+-record(db, {raw, cache, order, cache_size}).
 
 %% A prepared statement: cached, and reset after each use, or used once and
 %% finalized.
 -record(stmt, {ref, cached}).
 
 -define(SQLITE_BUSY, 5).
+-define(SQLITE_INTERRUPT, 9).
+%% How often a statement that undoes work is tried again when an interrupt
+%% meant for the statement before it aborts it.
+-define(UNDO_TRIES, 50).
 
 %% Failures are returned as glite/internal/db's Failure type:
 %%   {sqlite_failure, ExtendedCode, Message, Offset}
 %%   {row_limit_reached, MaxRows}
+%%   {infinite_real, Row}
 
 %% =============================================================================
 %% Connection
@@ -41,7 +50,8 @@ open(Path, CacheSize) ->
     case esqlite3:open(unicode:characters_to_list(Path)) of
         {ok, Raw} ->
             Cache = ets:new(glite_statements, [set, public]),
-            {ok, #db{raw = Raw, cache = Cache, cache_size = CacheSize}};
+            Order = ets:new(glite_statement_order, [ordered_set, public]),
+            {ok, #db{raw = Raw, cache = Cache, order = Order, cache_size = CacheSize}};
         {error, Code} when is_integer(Code) ->
             {error, {sqlite_failure, Code,
                      <<"could not open database: ", Path/binary>>, -1}};
@@ -51,14 +61,17 @@ open(Path, CacheSize) ->
 
 %% Finalize every cached statement first: left to the garbage collector, they
 %% would be finalized later, after the connection is gone.
-close(#db{raw = Raw, cache = Cache} = Db) ->
+close(#db{raw = Raw, cache = Cache, order = Order} = Db) ->
     clear_statements(Db),
     _ = esqlite3:close(Raw),
     %% A connection that failed to open never got a helper: its caller still
     %% owns the cache. Otherwise the cache goes with the helper.
     case ets:info(Cache, owner) =:= self() of
-        true -> true = ets:delete(Cache);
-        false -> ok
+        true ->
+            true = ets:delete(Cache),
+            true = ets:delete(Order);
+        false ->
+            ok
     end,
     nil.
 
@@ -71,19 +84,21 @@ interrupt(#db{raw = Raw}) ->
 
 %% Finalize and forget every cached statement. A process that died holding
 %% the connection may have left one half way through a query.
-clear_statements(#db{cache = Cache}) ->
+clear_statements(#db{cache = Cache, order = Order}) ->
     try ets:tab2list(Cache) of
         Entries ->
-            lists:foreach(fun({_Sql, Ref, _Analysis}) -> finalize(Ref) end, Entries),
-            true = ets:delete_all_objects(Cache)
+            lists:foreach(fun({_Sql, Ref, _Analysis, _Seq}) -> finalize(Ref) end, Entries),
+            true = ets:delete_all_objects(Cache),
+            true = ets:delete_all_objects(Order)
     catch
         error:badarg -> ok
     end,
     nil.
 
 %% Hand the statement cache to the process that will outlive every caller.
-give_away(#db{cache = Cache}, Pid) ->
+give_away(#db{cache = Cache, order = Order}, Pid) ->
     true = ets:give_away(Cache, Pid, glite_statements),
+    true = ets:give_away(Order, Pid, glite_statements),
     nil.
 
 %% =============================================================================
@@ -93,13 +108,14 @@ give_away(#db{cache = Cache}, Pid) ->
 %% The cached statement for Sql, with its analysis.
 cached(#db{cache = Cache}, Sql) ->
     case ets:lookup(Cache, Sql) of
-        [{Sql, Ref, Analysis}] -> {ok, {#stmt{ref = Ref, cached = true}, Analysis}};
+        [{Sql, Ref, Analysis, _Seq}] -> {ok, {#stmt{ref = Ref, cached = true}, Analysis}};
         [] -> {error, nil}
     end.
 
 %% Prepare Sql, which glite/internal/sql already checked, and cache it with
-%% its Analysis. When the cache is full, one statement is dropped for it.
-prepare(#db{raw = Raw, cache = Cache, cache_size = CacheSize} = Db, Sql, Analysis) ->
+%% its Analysis. When the cache is full, the statement it has held longest is
+%% dropped for it.
+prepare(#db{raw = Raw, cache = Cache, order = Order, cache_size = CacheSize} = Db, Sql, Analysis) ->
     case esqlite3:prepare(Raw, Sql) of
         {error, Code} ->
             {error, failure(Db, Code)};
@@ -107,16 +123,19 @@ prepare(#db{raw = Raw, cache = Cache, cache_size = CacheSize} = Db, Sql, Analysi
             {ok, #stmt{ref = Ref, cached = false}};
         {ok, {esqlite3_stmt, Ref}} ->
             case ets:info(Cache, size) >= CacheSize of
-                true -> evict_one(Cache);
+                true -> evict_oldest(Cache, Order);
                 false -> ok
             end,
-            true = ets:insert(Cache, {Sql, Ref, Analysis}),
+            Seq = erlang:unique_integer([monotonic]),
+            true = ets:insert(Cache, {Sql, Ref, Analysis, Seq}),
+            true = ets:insert(Order, {Seq, Sql}),
             {ok, #stmt{ref = Ref, cached = true}}
     end.
 
-evict_one(Cache) ->
-    Sql = ets:first(Cache),
-    [{Sql, Ref, _}] = ets:take(Cache, Sql),
+evict_oldest(Cache, Order) ->
+    Seq = ets:first(Order),
+    [{Seq, Sql}] = ets:take(Order, Seq),
+    [{Sql, Ref, _, Seq}] = ets:take(Cache, Sql),
     finalize(Ref).
 
 %% Done with a statement: reset a cached one, so it holds no locks and can
@@ -179,47 +198,113 @@ query(Db, #stmt{ref = Ref} = Stmt0, Params, MaxRows) ->
 
 %% Run one statement once per parameter list, all or nothing: the batch runs
 %% inside a savepoint that is rolled back if any run fails.
-execute_many(Db, Stmt, ParamsList, Kind) ->
+%%
+%% Deadline is the caller's, in glite_ffi:monotonic_ms/0 time. An interrupt
+%% only stops a statement that is running, and a batch is many short ones
+%% with Erlang in between, so the batch checks the deadline itself before
+%% each run. Fails with deadline_passed, or {batch_failed, Failure}.
+execute_many(#db{raw = Raw} = Db, Stmt, ParamsList, Kind, Deadline) ->
+    %% Outside a transaction the savepoint starts one, and releasing it
+    %% commits the batch.
+    Outermost = esqlite3:get_autocommit(Raw),
     case exec_script(Db, <<"SAVEPOINT glite_batch">>) of
-        {error, _} = Error ->
-            Error;
+        {error, Failure} ->
+            {error, {batch_failed, Failure}};
         {ok, nil} ->
-            case run_batch(Db, Stmt, Kind, ParamsList) of
+            case run_batch(Db, Stmt, Kind, ParamsList, Deadline) of
                 {ok, _} = Ok ->
                     case exec_script(Db, <<"RELEASE glite_batch">>) of
-                        {ok, nil} -> Ok;
-                        {error, _} = Error -> Error
+                        {ok, nil} ->
+                            Ok;
+                        {error, Failure} ->
+                            %% Not released, so not kept: an interrupt that
+                            %% lands on the RELEASE must not leave the batch
+                            %% half way.
+                            undo_batch(Db, Outermost),
+                            {error, {batch_failed, Failure}}
                     end;
                 {error, _} = Error ->
-                    %% Interrupts and some I/O errors roll back the whole
-                    %% transaction, taking the savepoint with it, so these
-                    %% two may fail; the batch is undone either way.
-                    _ = exec_script(Db, <<"ROLLBACK TO glite_batch">>),
-                    _ = exec_script(Db, <<"RELEASE glite_batch">>),
+                    undo_batch(Db, Outermost),
                     Error
             end
     end.
 
-run_batch(Db, #stmt{ref = Ref} = Stmt, Kind, ParamsList) ->
+%% Undo a batch that did not finish, whatever state its savepoint is in.
+%%
+%% A caller that timed out keeps interrupting the connection for a moment,
+%% and an interrupt that lands just as a statement starts aborts it, so each
+%% statement here is tried again when that happens. The savepoint is only
+%% released once it is rolled back: releasing one that still holds part of
+%% the batch would keep that part.
+undo_batch(#db{raw = Raw} = Db, Outermost) ->
+    case retry_interrupted(Db, <<"ROLLBACK TO glite_batch">>, ?UNDO_TRIES) of
+        {ok, nil} ->
+            case retry_interrupted(Db, <<"RELEASE glite_batch">>, ?UNDO_TRIES) of
+                {ok, nil} -> ok;
+                %% An empty savepoint is left open. Inside a transaction it
+                %% ends with the transaction; outside one it is the
+                %% transaction, so that is rolled back.
+                {error, _} when Outermost -> rollback_all(Db);
+                {error, _} -> ok
+            end;
+        {error, _} ->
+            case esqlite3:get_autocommit(Raw) of
+                %% An interrupt or an I/O error already rolled back the whole
+                %% transaction, and the savepoint with it.
+                true -> ok;
+                %% The savepoint can't be rolled back, so the transaction it
+                %% is part of goes: nothing of the batch may stay.
+                false -> rollback_all(Db)
+            end
+    end.
+
+rollback_all(#db{raw = Raw} = Db) ->
+    case retry_interrupted(Db, <<"ROLLBACK">>, ?UNDO_TRIES) of
+        {ok, nil} ->
+            ok;
+        {error, Failure} ->
+            case esqlite3:get_autocommit(Raw) of
+                true -> ok;
+                false -> erlang:error({glite_batch_not_undone, Failure})
+            end
+    end.
+
+retry_interrupted(Db, Sql, Tries) ->
+    case exec_script(Db, Sql) of
+        {error, {sqlite_failure, Code, _, _}}
+                when Code band 16#FF =:= ?SQLITE_INTERRUPT, Tries > 1 ->
+            retry_interrupted(Db, Sql, Tries - 1);
+        Result ->
+            Result
+    end.
+
+run_batch(Db, #stmt{ref = Ref} = Stmt, Kind, ParamsList, Deadline) ->
     try
-        run_batch_loop(Db, {esqlite3_stmt, Ref}, Kind, ParamsList, 0)
+        run_batch_loop(Db, {esqlite3_stmt, Ref}, Kind, ParamsList, Deadline, 0)
     after
         done(Stmt)
     end.
 
-run_batch_loop(_Db, _Stmt, _Kind, [], Total) ->
+run_batch_loop(_Db, _Stmt, _Kind, [], _Deadline, Total) ->
     {ok, Total};
-run_batch_loop(Db, Stmt, Kind, [Params | Rest], Total) ->
-    Before = total_changes_before(Db, Kind),
-    case bind_and_step(Db, Stmt, Params) of
-        ok ->
-            Changed = changes(Db, Kind, Before),
-            case esqlite3:reset(Stmt) of
-                ok -> run_batch_loop(Db, Stmt, Kind, Rest, Total + Changed);
-                {error, Code} -> {error, failure(Db, Code)}
-            end;
-        {error, _} = Error ->
-            Error
+run_batch_loop(Db, Stmt, Kind, [Params | Rest], Deadline, Total) ->
+    case glite_ffi:monotonic_ms() >= Deadline of
+        true ->
+            {error, deadline_passed};
+        false ->
+            Before = total_changes_before(Db, Kind),
+            case bind_and_step(Db, Stmt, Params) of
+                ok ->
+                    Changed = changes(Db, Kind, Before),
+                    case esqlite3:reset(Stmt) of
+                        ok ->
+                            run_batch_loop(Db, Stmt, Kind, Rest, Deadline, Total + Changed);
+                        {error, Code} ->
+                            {error, {batch_failed, failure(Db, Code)}}
+                    end;
+                {error, Failure} ->
+                    {error, {batch_failed, Failure}}
+            end
     end.
 
 %% Finalize a statement as soon as glite is done with it. Left to the garbage
@@ -238,22 +323,38 @@ bind_and_step(Db, Stmt, Params) ->
         {error, Code} -> {error, failure(Db, Code)}
     end.
 
+%% Step a statement. esqlite builds each row as Erlang terms, and an Erlang
+%% float can't be infinite, so a row holding an infinite REAL (9e999, or a
+%% stored 1e308 * 10) makes its step raise badarg after SQLite produced the
+%% row. That is reported as '$infinite_real'; the statement can be stepped
+%% on.
+step(Stmt) ->
+    try
+        esqlite3:step(Stmt)
+    catch
+        error:badarg -> '$infinite_real'
+    end.
+
 step_until_done(Db, Stmt) ->
-    case esqlite3:step(Stmt) of
+    case step(Stmt) of
         '$done' -> ok;
         '$busy' -> {error, failure(Db, ?SQLITE_BUSY)};
         {error, Code} -> {error, failure(Db, Code)};
+        %% The rows are not returned, so one that can't be read is no loss.
+        '$infinite_real' -> step_until_done(Db, Stmt);
         Row when is_list(Row) -> step_until_done(Db, Stmt)
     end.
 
 fetch(Db, Stmt, MaxRows, Count, Acc) ->
-    case esqlite3:step(Stmt) of
+    case step(Stmt) of
         '$done' ->
             {ok, lists:reverse(Acc)};
         '$busy' ->
             {error, failure(Db, ?SQLITE_BUSY)};
         {error, Code} ->
             {error, failure(Db, Code)};
+        '$infinite_real' ->
+            {error, {infinite_real, Count}};
         Row when is_list(Row), Count >= MaxRows ->
             {error, {row_limit_reached, MaxRows}};
         Row when is_list(Row) ->

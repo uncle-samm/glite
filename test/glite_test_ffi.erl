@@ -1,6 +1,6 @@
 -module(glite_test_ffi).
 -export([temp_path/1, delete_db/1, rescue/1, mailbox_size/0, kill_helper/1, queue_length/1, collect_garbage/0,
-         esqlite_has_finalize/0, file_exists/1]).
+         esqlite_has_finalize/0, file_exists/1, cached_statements/1]).
 
 temp_path(Name) ->
     Dir = case os:getenv("TMPDIR") of false -> "/tmp"; D -> D end,
@@ -44,3 +44,11 @@ esqlite_has_finalize() ->
 
 file_exists(Path) ->
     filelib:is_file(Path).
+
+%% The SQL of the connection's cached statements, oldest first. A Db is
+%% glite_sqlite_ffi's {db, Raw, Cache, Order, CacheSize}; every statement in
+%% Cache has one entry in Order.
+cached_statements({connection, _, {db, _, Cache, Order, _}, _}) ->
+    Ordered = [Sql || {_Seq, Sql} <- ets:tab2list(Order)],
+    true = lists:sort(Ordered) =:= lists:sort([Sql || {Sql, _, _, _} <- ets:tab2list(Cache)]),
+    Ordered.

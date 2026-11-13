@@ -14,6 +14,7 @@
 //// }
 //// ```
 
+import gleam/bit_array
 import gleam/int
 import gleam/option.{type Option, None, Some}
 import glite/error.{type Error}
@@ -130,10 +131,17 @@ pub fn float(value: Value) -> Result(Float, String) {
   }
 }
 
-/// Text.
+/// Text. Binary data that is valid UTF-8 is accepted too, because SQLite
+/// doesn't always say which of the two a value is: text read from a column
+/// declared as `BLOB` arrives as a `Blob`.
 pub fn text(value: Value) -> Result(String, String) {
   case value {
     value.Text(s) -> Ok(s)
+    value.Blob(bytes) ->
+      case bit_array.to_string(bytes) {
+        Ok(s) -> Ok(s)
+        Error(Nil) -> Error("expected Text, got a Blob that is not valid UTF-8")
+      }
     other -> Error(expected("Text", other))
   }
 }

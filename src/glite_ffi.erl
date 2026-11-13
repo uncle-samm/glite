@@ -24,7 +24,8 @@
 
 -export([
     coerce/1, monotonic_ms/0,
-    start/2, call/5, disconnect/2, holding/1
+    start/2, call/5, disconnect/2, holding/1,
+    in_transaction/1, transaction_running/1
 ]).
 
 %% A connection: the database, its shared state, its helper, and the ETS
@@ -100,6 +101,23 @@ start(Db, MaxQueue) ->
 %% of its transactions.
 holding(#conn{state = State}) ->
     get({glite_holding, State}) =:= true.
+
+%% Run Body(Token) as a transaction of the calling process. Until Body
+%% returns or raises, transaction_running(Token) is true in this process and
+%% nowhere else, so a Tx can tell whether it is still inside its transaction:
+%% one that was kept after it ended, or sent to another process, would run
+%% its statements without holding the connection.
+in_transaction(Body) ->
+    Token = make_ref(),
+    put({glite_transaction, Token}, true),
+    try
+        Body(Token)
+    after
+        erase({glite_transaction, Token})
+    end.
+
+transaction_running(Token) ->
+    get({glite_transaction, Token}) =:= true.
 
 %% =============================================================================
 %% Calls

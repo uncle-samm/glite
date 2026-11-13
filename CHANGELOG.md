@@ -1,6 +1,57 @@
 # Changelog
 
-## v0.5.0 - Unreleased
+## Unreleased
+
+### Fixed
+
+- Reading an infinite REAL (`9e999`, or a stored `1e308 * 10`) crashed the
+  calling process with `badarg`. It is now a `Decode` error that names the
+  row, and `exec` and `exec_many` run statements that return such rows.
+- A transaction that SQLite rolled back by itself (`ON CONFLICT ROLLBACK`,
+  `RAISE(ROLLBACK)`, a full disk, an I/O error) kept running: the body's
+  later statements ran outside any transaction and were each committed on
+  their own, and the result was a confusing "cannot commit" error. Those
+  statements now return the new `TransactionEnded` error without running,
+  and the transaction's result is `Database(TransactionEnded)`.
+- `$1`, `:1` and `@1` were not counted as parameters, so a statement using
+  them was refused with "the statement has 0 parameter(s)". They are
+  parameters now. SQLite numbers them in the order they first appear, not by
+  their number, so SQL that uses them out of order (`SELECT $2, $1`) is
+  `InvalidSql` with a message that says to use `?2`, instead of binding the
+  values the wrong way round.
+- `:a`, `@a` and `$a` in one statement were counted as one parameter; to
+  SQLite they are three. Tcl-style names (`$ns::a`, `$a(1)`) are counted as
+  SQLite counts them.
+- A `Tx` kept after its transaction ended, or sent to another process, ran
+  its statements without holding the connection, in the middle of whatever
+  another caller was doing. Using one now panics with a clear message.
+- `glite.disconnect` called from inside the connection's own transaction
+  waited for itself until the call timeout. It now panics with a clear
+  message, like every other call on the connection from there.
+- An interrupt that landed on the last statements of an `exec_many` batch
+  could leave part of the batch in place, or leave its savepoint open. The
+  batch is now undone whatever state the interrupt left it in.
+- `exec_many` checks the call's deadline between runs. An interrupt only
+  stops a statement that is running, so a large batch of quick statements
+  used to run to its end long after `call_timeout_ms`.
+- A full statement cache dropped a statement picked by hash order, which
+  could be the one used most. It now drops the statement cached longest.
+- `decode.text` accepts a blob that is valid UTF-8, as `decode.blob` already
+  accepted text: text stored in a column declared `BLOB` arrives as a blob.
+
+### Added
+
+- `error.TransactionEnded`. Code that matches on every `Error` variant needs
+  a branch for it.
+- `glite/value.Rows`, the type `query_rows` returns. It was defined in an
+  internal module, so its documentation was hidden; `glite.Rows` is still an
+  alias for it.
+
+### Changed
+
+- esqlite 0.10.1.
+
+## v0.5.0 - 2026-11-06
 
 ### Changed
 

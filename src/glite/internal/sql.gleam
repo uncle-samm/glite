@@ -4,12 +4,15 @@
 //// - Is it exactly one statement? esqlite prepares only the first statement
 ////   and silently drops the rest, so more than one is refused.
 //// - How many parameters does it take? SQLite binds missing parameters as
-////   NULL, so a count mismatch is refused.
+////   NULL, so a count mismatch is refused. So is `$2` before `$1`: SQLite
+////   reads `$N`, `:N` and `@N` as names and numbers them in the order they
+////   first appear, so the values would be bound the other way round.
 //// - Does it change rows (INSERT, UPDATE, DELETE, REPLACE), maybe (WITH), or
 ////   not at all? `sqlite3_changes` only counts the first kind.
 
 import gleam/bit_array
 import gleam/int
+import gleam/result
 import gleam/set.{type Set}
 import gleam/string
 import glite/error.{type Error}
@@ -45,7 +48,8 @@ type State {
     ended: Bool,
     /// The highest parameter number so far.
     max: Int,
-    /// Named parameters seen so far: a name used twice is one parameter.
+    /// Named parameters seen so far, sigil included: a name used twice is one
+    /// parameter, and `:a`, `@a` and `$a` are three.
     names: Set(BitArray),
   )
 }
@@ -103,20 +107,22 @@ fn scan(sql: BitArray, state: State) -> Result(Analysis, Error) {
       scan(rest, token(State(..state, max:)))
     }
     <<p, c, _:bits>>, _ if p == 58 || p == 64 || p == 36 -> {
-      case is_ident_start(c) {
+      case is_ident(c) {
         False -> scan(drop(sql, 1), token(state))
         True -> {
-          let #(name, rest) = take_while(drop(sql, 1), is_ident)
-          let state = case set.contains(state.names, name) {
-            True -> state
-            False ->
-              State(
-                ..state,
-                max: state.max + 1,
-                names: set.insert(state.names, name),
-              )
+          let length = name_length(drop(sql, 1), 1)
+          let name = slice(sql, 0, length)
+          let rest = drop(sql, length)
+          case set.contains(state.names, name) {
+            True -> scan(rest, token(state))
+            False -> {
+              // SQLite gives a new name the next free number.
+              let index = state.max + 1
+              use Nil <- result.try(check_numbered_name(name, index))
+              let names = set.insert(state.names, name)
+              scan(rest, token(State(..state, max: index, names:)))
+            }
           }
-          scan(rest, token(state))
         }
       }
     }
@@ -201,6 +207,67 @@ fn first_word(words: List(String)) -> String {
     [] -> ""
     [word] -> word
     [_, ..rest] -> first_word(rest)
+  }
+}
+
+/// The length in bytes of a named parameter, as SQLite's tokenizer reads it:
+/// the sigil, then letters, digits, `_` and `$`, with Tcl's `::` between
+/// them and one Tcl array index, such as `(key)`, after them. `sql` starts
+/// after the first `n` bytes of the name.
+fn name_length(sql: BitArray, n: Int) -> Int {
+  case sql {
+    <<"::":utf8, rest:bits>> -> name_length(rest, n + 2)
+    <<"(":utf8, rest:bits>> -> n + 1 + index_length(rest, 0)
+    <<c, rest:bits>> ->
+      case is_ident(c) {
+        True -> name_length(rest, n + 1)
+        False -> n
+      }
+    _ -> n
+  }
+}
+
+/// The length of the rest of a Tcl array index: up to and including its
+/// `)`, or up to the whitespace that ends it without one.
+fn index_length(sql: BitArray, n: Int) -> Int {
+  case sql {
+    <<")":utf8, _:bits>> -> n + 1
+    <<c, _:bits>> if c == 32 || c == 9 || c == 10 || c == 13 || c == 12 -> n
+    <<_, rest:bits>> -> index_length(rest, n + 1)
+    _ -> n
+  }
+}
+
+/// `$1`, `:1` and `@1` look numbered, as in PostgreSQL, but to SQLite they
+/// are names: each takes the next free number when it first appears. Written
+/// in order they mean what they say; otherwise the values would be bound to
+/// the wrong parameters, so the SQL is refused.
+fn check_numbered_name(name: BitArray, index: Int) -> Result(Nil, Error) {
+  case name {
+    <<_sigil, digits:bits>> ->
+      case count_while(digits, is_digit, 0) == bit_array.byte_size(digits) {
+        False -> Ok(Nil)
+        True ->
+          case digits_to_int(digits, 0) == index {
+            True -> Ok(Nil)
+            False -> {
+              let name = lowercase(name)
+              let number = lowercase(digits)
+              Error(error.InvalidSql(
+                "SQLite reads "
+                <> name
+                <> " as a name, not a number, and names are numbered in the order they first appear: "
+                <> name
+                <> " would take value "
+                <> int.to_string(index)
+                <> " of the parameter list; write ?"
+                <> number
+                <> " instead",
+              ))
+            }
+          }
+      }
+    _ -> Ok(Nil)
   }
 }
 

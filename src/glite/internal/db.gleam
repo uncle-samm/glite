@@ -11,7 +11,7 @@ import glite/config.{type Config}
 import glite/decode.{type RowDecoder}
 import glite/error.{type Error}
 import glite/internal/sql as scanner
-import glite/value.{type Value}
+import glite/value.{type Rows, type Value, Rows}
 
 /// An open esqlite connection and its cache of prepared statements.
 pub type Db
@@ -76,10 +76,18 @@ fn rollback_within(db: Db, tries: Int) -> Nil {
   }
 }
 
-/// Column names and rows from a query.
-pub type Rows {
-  Rows(columns: List(String), rows: List(List(Value)))
-}
+/// Marks one running transaction in the process that runs it.
+pub type Token
+
+/// Run `body` as a transaction of the calling process: until it returns or
+/// panics, `transaction_running` is true for its token, in this process only.
+@external(erlang, "glite_ffi", "in_transaction")
+pub fn in_transaction(body: fn(Token) -> a) -> a
+
+/// Whether the calling process is still inside the transaction `token` was
+/// made for.
+@external(erlang, "glite_ffi", "transaction_running")
+pub fn transaction_running(token: Token) -> Bool
 
 /// What the Erlang side reports when SQLite fails. Turned into an `Error`
 /// by `from_failure`.
@@ -89,6 +97,16 @@ type Failure {
   SqliteFailure(code: Int, message: String, offset: Int)
   /// The query produced more than this many rows.
   RowLimitReached(limit: Int)
+  /// The row at this position, counting from 0, holds an infinite REAL,
+  /// which the Erlang VM has no float for.
+  InfiniteReal(row: Int)
+}
+
+/// Why a batch didn't run to its end.
+type BatchFailure {
+  /// The caller's deadline passed between two runs.
+  DeadlinePassed
+  BatchFailed(Failure)
 }
 
 /// Why `VACUUM INTO` didn't write a copy.
@@ -151,7 +169,8 @@ fn ffi_execute_many(
   statement: Statement,
   params: List(List(Value)),
   kind: scanner.Kind,
-) -> Result(Int, Failure)
+  deadline: Int,
+) -> Result(Int, BatchFailure)
 
 @external(erlang, "glite_sqlite_ffi", "backup")
 fn ffi_backup(db: Db, path: String) -> Result(Nil, CopyFailure)
@@ -277,8 +296,11 @@ pub fn exec_many(
       list.try_each(params, check_params(_, analysis))
     }),
   )
-  ffi_execute_many(db, statement, params, analysis.kind)
-  |> result.map_error(from_failure)
+  case ffi_execute_many(db, statement, params, analysis.kind, limits.deadline) {
+    Ok(changed) -> Ok(changed)
+    Error(DeadlinePassed) -> Error(error.Timeout(limits.timeout_ms))
+    Error(BatchFailed(failure)) -> Error(from_failure(failure))
+  }
 }
 
 pub fn user_version(db: Db, limits: Limits) -> Result(Int, Error) {
@@ -577,6 +599,12 @@ const sqlite_constraint = 19
 fn from_failure(failure: Failure) -> Error {
   case failure {
     RowLimitReached(limit:) -> error.RowLimitExceeded(limit)
+    InfiniteReal(row:) ->
+      error.Decode(
+        "a column of this row holds an infinite REAL, which Gleam on the Erlang VM has no Float for; select it as text with CAST, or compare it in SQL",
+        row:,
+        column: 0,
+      )
     SqliteFailure(code:, message:, offset:) -> {
       let primary = int.bitwise_and(code, 0xFF)
       case primary {

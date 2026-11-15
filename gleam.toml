@@ -1,5 +1,5 @@
 name = "glite"
-version = "0.5.0"
+version = "0.6.0"
 description = "A SQLite driver for Gleam on the Erlang VM: isolated transactions, bounded calls, no actor in the way."
 licences = ["Apache-2.0"]
 repository = { type = "github", user = "uncle-samm", repo = "glite" }
